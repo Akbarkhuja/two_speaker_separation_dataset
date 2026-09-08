@@ -1,0 +1,308 @@
+# dual_separation_dataset
+
+Turns dual-channel telephony recordings into a 2-speaker separation dataset:
+one mixture plus two ground-truth source signals per call, with
+`mix == s1 + s2` holding sample-for-sample.
+
+The corpus works for this because **the two parties sit on physically isolated
+channels**. Measured across 158 calls, cross-channel `|corr|` is mean 0.0006 /
+max 0.005 — there is no echo bleed, so once the non-speech is silenced each
+channel *is* a clean source and their sum is an exact, fully-labelled mixture
+rather than an approximation.
+
+---
+
+## Setup
+
+Everything runs in the existing `nemo` conda env:
+
+```bash
+conda activate nemo          # /home/akbar/miniconda3/envs/nemo
+cd /home/akbar/craft/prod/dual_separation_dataset
+python -m dsd --help
+```
+
+See `requirements.txt` for what is used and which stage needs it. Heavy imports
+(torch, NeMo, silero, librosa) are lazy — `python -m dsd backends` and `--help`
+load none of them.
+
+---
+
+## Running it
+
+```bash
+python -m dsd run                       # every stage, in order
+python -m dsd run --stages vad,embed    # a slice
+python -m dsd run --from cluster        # from a stage onward
+python -m dsd diarize --limit 30        # one stage
+python -m dsd verify                    # check a finished dataset
+python -m dsd backends                  # what is registered
+python -m dsd config                    # the resolved configuration
+```
+
+Global flags go **before** the subcommand:
+
+```bash
+python -m dsd --set build.chunks=true --set select.max_calls_per_speaker=2 run
+python -m dsd --set paths.work_dir=work_experiment run --stages diarize,filter
+```
+
+Every stage is idempotent and resumable. Per-file stages (`diarize`, `vad`)
+skip a call whose output already exists; whole-artifact stages skip unless
+`--overwrite`. A call that raises is recorded in `work/<stage>_failed.tsv` and
+the run continues — with 5600 calls, one unreadable file must not cost the rest.
+
+### On real data
+
+```bash
+python -m dsd run --stages diarize,filter,vad,embed,cluster,select,build \
+                  --limit 30 --chunks   # `enhance` left out: it is the slow one
+python -m dsd verify
+```
+
+`gender` is omitted because it needs a service (below); `select` skips balancing
+with a warning when `work/gender.json` is absent, so the chain still completes.
+
+---
+
+## Tests
+
+```bash
+python tests/smoke.py             # 50 checks in ~4 s. No GPU, no network, no weights.
+python tests/smoke.py --real 10   # additionally: 10 real calls through the real models
+python tests/smoke.py --only fade # run checks matching a substring
+```
+
+`dsd verify` checks a finished dataset; `tests/smoke.py` checks the code that
+produced it. Four groups:
+
+- **unit** — pure functions against brute force where an independent
+  implementation is cheap: interval subtraction on a sample grid, the overlap FFT
+  against `np.roll` at *every* shift, `mix == s1 + s2` surviving the peak guard.
+- **config** — override typing, `*_dir` resolution against root, registry contract.
+- **http** — the MOSS, gender and enhancement clients replayed against the
+  payloads their servers are documented to return, via a local stub server.
+- **e2e** — a synthetic corpus of eight planted calls driven through all nine
+  stages with stub backends. Because the corpus is constructed, the assertions are
+  exact: which calls survive the filter and *why each other one dies*, that the
+  clustering recovers precisely the eight voices put in, that splits are
+  speaker-disjoint, and that an excluded minor-label span is actually silent in
+  the built wav.
+
+Adding a backend? Register a stub in the test the way `StubVAD` / `StubEmbedder` /
+`StubGender` / `StubEnhancer` do — the e2e run needs no GPU because of them.
+
+---
+
+## The stages
+
+```
+diarize -> filter -> vad -> embed -> cluster -> gender -> select -> enhance -> build
+```
+
+| stage | writes | what it does |
+|---|---|---|
+| `diarize` | `work/rttms/<call>.rttm` | Demuxes each channel and diarizes it alone, so the **channel is the speaker identity**. Labels are namespaced `ch{c}_{label}`. |
+| `filter` | `work/suitable.json`, `work/unsuitable.json` | Keeps calls where each channel holds exactly one speaker. Every rejection carries a `reason`. |
+| `vad` | `work/vad/<call>.rttm` | Per-channel Silero speech masks — the source of truth for zerofying and chunking. |
+| `embed` | `work/embeddings.npz`, `work/embed_index.json` | One TitaNet-L vector per speaker per call, duration-weighted. |
+| `cluster` | `work/speakers.json` | Global speaker identities via constrained complete-linkage AHC. |
+| `gender` | `work/gender.json` | Male/female per global speaker, for balancing. |
+| `select` | `work/selection.json` | Speaker cap, gender balance, speaker-disjoint splits. |
+| `enhance` | `work/enhanced/<call>.flac` | Denoises both channels via the MossFormerGAN service, **before** they are summed. Optional but cached. |
+| `build` | `dataset/` | Zerofy, shift, level, sum. Writes the wavs, manifests and `stats.json`. |
+
+### Output layout
+
+```
+dataset/
+  {train,dev,test}/<call>/{mix,s1,s2}.wav + meta.json
+  chunks/{train,dev,test}/{mix,s1,s2}/<call>_<idx>.wav   # with --chunks
+
+  manifest.jsonl                                          # every call
+  train.jsonl  dev.jsonl  test.jsonl                      # the same rows, per split
+  chunks/manifest.jsonl                                   # every chunk
+  chunks/train.jsonl  chunks/dev.jsonl  chunks/test.jsonl
+
+  stats.json                                              # realized vs target
+```
+
+Point a trainer straight at a split — `dataset/chunks/train.jsonl`. Every configured
+split gets a file even when it holds nothing, so a path in a training command is
+never missing; `verify` checks the split files partition the combined manifest
+exactly, which is what catches one left stale by an earlier build.
+
+8 kHz PCM_16, the source rate — nothing is resampled on the way out. The only
+resampling anywhere is the 16 kHz that TitaNet forces internally.
+
+---
+
+## Things worth knowing
+
+**The shipped `Datasets/rttms/` cannot be filtered as-is.** Those 5602 files are
+*mono-mode* MOSS output: across all 203 444 lines the channel field is always
+`1` and speakers are `S01`/`S02`/`S03`. Reading field 3 as a channel — which the
+original notebook and `sandbox/sep_data_pipeline/filter_1.py` both do — silently
+puts every speaker on one channel. The `filter` stage detects a constant channel
+field and switches to `energy` mode, recovering the mapping from per-channel
+energy instead. Use them with `--set diarize.backend=from_dir`.
+
+**Sortformer runs offline, not streaming.** The notebook copied a 1.04 s-latency
+streaming preset from an NVIDIA tutorial. For batch work it is strictly worse —
+measured on one 389 s call, both channels:
+
+| | speed | result |
+|---|---|---|
+| offline | **259x** realtime | ch1 → 1 speaker label |
+| streaming | 21x realtime | ch1 → 2 speaker labels |
+
+Twelve times slower *and* noisier: the rotating speaker cache re-identifies the
+same voice and splits it, which then makes the filter reject a good call. Over
+the corpus that is ~1.9 h versus ~23 h. Full context also holds up on the worst
+case — the longest call (1807 s, both channels) takes 12.7 s at 2.5 GiB VRAM.
+Set `diarize.options.sortformer.streaming: true` to reproduce the old numbers.
+
+**"One speaker per channel" is measured in speech, not label count.** A diarizer
+run on a single telephone channel invents a second label freely. Measured over
+30 calls, a second label is a median of **1.5 s** against a main speaker's 40 s —
+a breath, a noise burst, faint bleed. Rejecting those like a genuine second
+speaker dropped the pass rate to 10%. A minor label now only counts as a second
+*person* if it clears both `min_label_speech_sec` (2.0) and `min_label_share`
+(0.10). Below that its time goes into `excluded` and is **cut out of the source**
+by `embed` and `build` — so if it really was a brief third voice, that voice is
+removed rather than mixed into someone's clean channel.
+
+**Purity is mode-dependent.** In `energy` mode purity is what makes the argmax
+assignment trustworthy, so `purity_min` is 0.9. In `channel` mode the assignment
+came from the demux and cannot be wrong, so `purity_min_channel_mode` is only
+0.5. It has to be loose: the measure divides by the *other* channel's energy
+during this speaker's turns, so ordinary line noise on a quiet channel drags a
+perfectly clean source to 0.72–0.86. Only below 0.5 is something actually broken.
+
+**Natural overlap is ~3%, so most mixtures are boosted.** Measured with Silero
+across 25 calls: mean 3.2%, p90 7.0%. Realistic telephony, but a model trained
+only on that barely has to separate anything. Since the channels are isolated,
+`build` can roll `s2` in time and the mixture stays perfectly labelled.
+`natural_frac` (0.6) of calls are left as recorded; the rest are shifted to land
+inside `target_overlap`. The shift is found by cross-correlating the two speech
+masks, giving the overlap for *every* shift in one FFT.
+
+**The overlap shift wraps, so it is constrained to wrap in silence.** `np.roll` is
+circular: rolling `s2` by `k` cuts the original at sample `n - k` and joins original sample
+`n - 1` to sample `0`. Left unconstrained, the first of those landed inside an utterance on
+**22.4% of shifted calls** — chopping a word and putting its two halves at opposite ends of
+the file, which sounds exactly like the audio has been shuffled. `shift_for_target` now
+considers only offsets whose seams fall in `build.seam_guard_ms` (200 ms) of silence.
+Measured over the 983 shifted calls of a real build: **220 chopped utterances before, 0
+after**, with 781 calls still shifted and overlap unchanged (mean 0.264, 99.9% in band). The
+202 that decline are calls whose recording starts or ends mid-speech, where no offset is
+safe; `meta.json` records `shift_reason` and `stats.json` counts them.
+
+**`mix == s1 + s2` is the invariant everything rests on.** When anything clips,
+all three signals are scaled by the same factor — scaling only the mixture would
+break the identity that every separation loss assumes. `verify` asserts it at
+`1e-4`, which is the PCM_16 quantization floor (three independently rounded
+files, ~1.5 LSB); observed worst case is `3.05e-05`.
+
+The peak guard covers **all three signals, not just the mixture**. A source can
+exceed full scale while the sum does not: `scale_to_sir` pushes s2 well above 1.0
+at a negative SIR, and wherever the two sources partially cancel the mixture
+still fits under the ceiling. The PCM_16 write then clips s2 alone. Guarding only
+the mixture broke the identity on **22 of 2513 calls**, with residuals to
+`1.06e-01` — every one a negative-SIR call whose s2 was pinned at 1.0000 while
+the mixture sat exactly at the 0.99 ceiling.
+
+**Zerofying fades its edges.** Hard-zeroing at every VAD boundary leaves a click
+correlated perfectly with the label, and a separation model will learn the
+clicks instead of the voices. `build.fade_ms` (10 ms) applies a raised-cosine
+taper at each edge.
+
+**Enhancement runs before the sum, and in its own stage.** Speech enhancement is
+non-linear, so `enhance(s1 + s2) != enhance(s1) + enhance(s2)` — it has to be applied to
+the two isolated channels and the mixture formed afterwards, or `mix == s1 + s2` stops
+holding. It is a separate stage rather than part of `build` because throughput is fixed at
+**~3.2x realtime and does not improve with concurrency** (measured 3.17x / 3.28x / 3.27x at
+1 / 4 / 8 workers: one replica, adaptive batch cap 1), while `build` is the stage you re-run
+most. Only the VAD speech spans are sent — everything else is zerofied by `build` anyway —
+which takes the selected set from ~44 h to **~22 h**. The service returns 8 kHz when
+`output_sample_rate` is omitted, and length is preserved exactly, so every VAD offset stays
+valid; verified on real audio, the untouched 65% of a call differs by at most half a PCM_16
+LSB while speech differs by ~120.
+
+**Splits are speaker-disjoint by construction.** Calls are edges between two
+global speakers, and whole connected components go to one split. A per-call
+random split leaks the same voice into train and test, which is the standard way
+a separation benchmark ends up flattering itself.
+
+---
+
+## Services
+
+Two backends need something running. They both default to **port 8000**, so they
+cannot both be up:
+
+```bash
+# gender stage -- moved to 8001 to avoid the collision.
+# BIND must move too; the server binds 8000 inside the container regardless.
+docker pull akbarumirzokov/gender-detection:latest
+docker run --name gender-detection-api \
+  -e BIND=0.0.0.0:8001 -p 8001:8001 \
+  akbarumirzokov/gender-detection:latest
+
+# moss_http diarizer -- see sandbox/moss_serving/
+docker compose up -d moss-server           # vLLM, port 8000
+```
+
+```bash
+# enhance stage -- the MossFormerGAN service, port 8000
+cd /home/akbar/craft/prod/mossformergan_serve && docker compose up -d
+curl -s localhost:8000/healthz
+```
+
+MOSS is 0.9 B and wants ~6 GB VRAM, so on a single 8 GB card it cannot share the
+GPU with the Sortformer or TitaNet stages. `sortformer` is the practical default.
+
+---
+
+## Adding a model
+
+Five registries — `DIARIZERS`, `VADS`, `EMBEDDERS`, `GENDER`, `CLUSTERERS`.
+A new backend is one file plus a decorator; no stage code changes:
+
+```python
+# dsd/backends/diarizers/pyannote.py
+from ...registry import DIARIZERS
+
+class PyannoteDiarizer:
+    needs_audio = True
+    def __init__(self, options): ...
+    def diarize(self, call, audio_path, data, sr): ...   # -> list[Segment]
+
+@DIARIZERS.register("pyannote")
+def _build(options): return PyannoteDiarizer(options)
+```
+
+Import it in `dsd/backends/diarizers/__init__.py`, add an options block under
+`diarize.options.pyannote` in `configs/default.yaml`, and select it with
+`--set diarize.backend=pyannote`. Each family's `base.py` holds the `Protocol`
+it must satisfy. Factories must stay lazy — registering must never load weights.
+
+A new **stage** is the same idea: a module exposing `NAME`, `REQUIRES`,
+`add_args(parser)` and `run(cfg, args)`, appended to `ORDER` in
+`dsd/stages/__init__.py`.
+
+---
+
+## Status
+
+Verified end to end on a 30-call slice: `diarize → filter → vad → embed →
+cluster → select → build → verify`, all green, 14 calls and 337 chunks built,
+`verify` passing. `tests/smoke.py` is green at 42/42.
+
+Not yet exercised against a live service: the **`gender`** stage (needs the
+Docker image re-pulled) and the **`moss_http`** diarizer (needs the server up).
+Both have their payload parsing covered by the `http` checks, but neither has
+been run against the real thing. A **full-corpus run** has not been done either.
+
+`tutorials/explore.ipynb` is the original notebook this pipeline was derived
+from, kept for reference.

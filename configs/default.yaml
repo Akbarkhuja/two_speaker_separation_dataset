@@ -1,0 +1,161 @@
+# Every knob the pipeline has. Override per run without editing this file:
+#   python -m dsd --set build.chunks=true --set select.max_calls_per_speaker=2 run
+
+seed: 1234
+sample_rate: 8000            # the source rate; nothing is resampled on the way out
+
+paths:
+  root: .                    # everything below is resolved against this
+  audio_dirs: ["Datasets/audios"]
+  pattern: "**/*.opus"
+  work_dir: work             # all intermediates land here
+  dataset_dir: dataset
+
+# --------------------------------------------------------------------------- #
+# 1. diarize -> work/rttms/
+# --------------------------------------------------------------------------- #
+diarize:
+  backend: sortformer        # sortformer | moss_http | from_dir
+  workers: 1                 # >1 only helps moss_http; local GPU backends serialize
+  options:
+    sortformer:
+      model_path: /home/akbar/craft/prod/steno2/core/ml/model_weights/diar_streaming_sortformer_4spk-v2.1.nemo
+      device: auto
+      # Offline full-context inference. Measured on one 389 s call, both
+      # channels: 259x realtime offline vs 21x streaming, and streaming also
+      # split one speaker into two labels. Only set this true to reproduce the
+      # notebook's streaming numbers.
+      streaming: false
+      batch_size: 2
+    moss_http:
+      host: 127.0.0.1
+      port: 8000
+      model: OpenMOSS-Team/MOSS-Transcribe-Diarize
+      max_new_tokens: 16384
+      timeout: 1800.0
+    from_dir:
+      # The 5602 mono-mode RTTMs that shipped with the corpus. Their channel
+      # field is a constant, so filter.channel_mode must resolve to `energy`
+      # for them -- `auto` handles that.
+      rttm_dir: Datasets/rttms
+
+# --------------------------------------------------------------------------- #
+# 2. filter -> work/suitable.json, work/unsuitable.json
+# --------------------------------------------------------------------------- #
+filter:
+  channel_mode: auto         # auto | channel | energy
+  expected_channels: 2
+  purity_min: 0.9            # share of a speaker's energy that must be in its channel
+  min_speech_sec: 3.0
+  workers: 8
+
+# --------------------------------------------------------------------------- #
+# 3. vad -> work/vad/
+# --------------------------------------------------------------------------- #
+vad:
+  backend: silero
+  options:
+    silero:
+      min_speech_duration_ms: 250
+      min_silence_duration_ms: 200
+      speech_pad_ms: 20
+      threshold: 0.5
+
+# --------------------------------------------------------------------------- #
+# 4. embed -> work/embeddings.npz, work/embed_index.json
+# --------------------------------------------------------------------------- #
+embed:
+  backend: titanet
+  min_speech_duration: 1.2   # shorter segments carry too little voice
+  longest_chunk_duration: 20.0
+  expected_speakers: 2
+  batch_size: 16
+  options:
+    titanet:
+      model_path: /home/akbar/craft/prod/steno2/core/ml/model_weights/titanet-l.nemo
+      device: auto
+
+# --------------------------------------------------------------------------- #
+# 5. cluster -> work/speakers.json
+# --------------------------------------------------------------------------- #
+cluster:
+  backend: constrained_ahc
+  threshold: 0.8             # on the rescaled (cos + 1) / 2 scale, i.e. raw cosine 0.6
+  report: true
+  options:
+    constrained_ahc:
+      linkage: complete      # complete | average
+
+# --------------------------------------------------------------------------- #
+# 6. gender -> work/gender.json
+# --------------------------------------------------------------------------- #
+gender:
+  backend: http_ecapa
+  segments_per_speaker: 3
+  max_total_sec: 30.0
+  min_segment_sec: 1.0
+  workers: 4
+  options:
+    http_ecapa:
+      # 8001, not the image's default 8000: that is the MOSS server's port.
+      # Start it with `-e BIND=0.0.0.0:8001 -p 8001:8001`.
+      base_url: http://localhost:8001
+      timeout: 120.0
+
+# --------------------------------------------------------------------------- #
+# 7. select -> work/selection.json
+# --------------------------------------------------------------------------- #
+select:
+  max_calls_per_speaker: 3
+  balance_gender: true
+  gender_tolerance: 0.02
+  min_speech_sec: 5.0
+  splits:
+    train: 0.90
+    dev: 0.05
+    test: 0.05
+
+# --------------------------------------------------------------------------- #
+# 8. enhance -> work/enhanced/
+# --------------------------------------------------------------------------- #
+# Denoises the two channels BEFORE they are summed. It has to happen here rather
+# than in `build`: enhancement is non-linear, so enhancing the mixture would
+# break `mix == s1 + s2`. Its own stage because throughput is ~3.2x realtime and
+# does not improve with concurrency, while `build` gets re-run constantly.
+enhance:
+  backend: http_mossformergan
+  regions: speech            # speech | full -- non-speech is zerofied by build anyway
+  merge_gap: 0.5             # join VAD spans closer than this into one request
+  context_sec: 0.5           # run-in context per span, trimmed off before splicing
+  min_span_sec: 0.3
+  format: flac               # cache container; lossless at PCM_16, ~half of WAV
+  workers: 2
+  options:
+    http_mossformergan:
+      # Where mossformergan_serve actually runs. Note this is also moss_http's
+      # default port, so the enhancer and the MOSS diarizer cannot both be up.
+      base_url: http://localhost:8000
+      timeout: 600.0
+      retries: 3
+
+# --------------------------------------------------------------------------- #
+# 9. build -> dataset/
+# --------------------------------------------------------------------------- #
+build:
+  # auto: use work/enhanced/<call> when present.  always: fail when it is
+  # missing, so a half-enhanced dataset cannot be built by accident.  never:
+  # ignore the cache.
+  use_enhanced: auto
+  fade_ms: 10.0              # raised-cosine taper at every VAD mask edge
+  natural_frac: 0.6          # share of calls left exactly as recorded
+  target_overlap: [0.15, 0.60]
+  # The shift wraps circularly. Only offsets whose wrap seams land in this much
+  # silence are used, so an utterance is never cut in half with its two halves
+  # at opposite ends of the file.
+  seam_guard_ms: 200.0
+  sir_db: [-5.0, 5.0]
+  peak_ceiling: 0.99
+  chunks: false
+  chunk_sec: 4.0
+  chunk_hop: 2.0
+  min_active_per_src: 0.5

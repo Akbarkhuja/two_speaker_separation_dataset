@@ -1,0 +1,27 @@
+# Versions are the ones this pipeline was developed and run against, in the
+# `nemo` conda env (/home/akbar/miniconda3/envs/nemo). They are recorded rather
+# than pinned -- nothing here depends on an exact patch release.
+#
+#   conda activate nemo
+#
+# Always imported
+numpy==2.5.2
+soundfile==0.14.0
+PyYAML==6.0.3
+tqdm==4.70.0
+
+# Imported lazily, only by the backend that needs them. A run that stays on one
+# backend never pays for the others -- `python -m dsd backends` and `--help`
+# touch none of them.
+torch==2.13.0            # sortformer, titanet, silero
+nemo_toolkit==3.0.0      # sortformer diarizer, titanet embedder  (extras: [asr])
+silero-vad==6.2.1        # vad stage
+librosa==0.11.0          # core.audio.resample -- 8 kHz -> 16 kHz for titanet
+requests==2.34.2         # moss_http diarizer, http_ecapa gender client
+urllib3==2.7.0           # the pooled-session Retry policy for both clients
+
+# Not a Python dependency, but the two HTTP backends need a service running:
+#   gender   docker run --name gender-detection-api \
+#              -e BIND=0.0.0.0:8001 -p 8001:8001 \
+#              akbarumirzokov/gender-detection:latest
+#   moss     see sandbox/moss_serving/docker-compose.yml  (port 8000)
