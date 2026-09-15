@@ -9,6 +9,15 @@ independently quantized to 16-bit PCM, so `mix - (s1 + s2)` carries up to about
 1.5 LSB of rounding, roughly 4.6e-5. Anything materially larger means the peak
 guard scaled the mixture without scaling the sources, or the files came from
 different runs.
+
+Which form of that check applies depends on how the dataset was built, and
+`stats.json` says which. Under `build.zerofy_mix` the mixture is the sum of the
+two zerofied sources and the identity holds everywhere. By default it is the two
+channels as recorded, so `mix - (s1 + s2)` is the background between the turns:
+the identity then holds only where both speakers are at full gain, and what is
+checked elsewhere is that the background stays below the voices rather than
+above them. A dataset with no `stats.json`, or one written before this option
+existed, is checked the strict way.
 """
 
 from __future__ import annotations
@@ -26,6 +35,157 @@ NAME = "verify"
 REQUIRES = ("build",)
 
 MIX_TOLERANCE = 1e-4
+# A mixture whose background is louder than the two voices is not a mixture of
+# those two voices. Deliberately loose -- this is a wrong-file check, not a
+# quality bar; real calls in this corpus measure 20-40 dB.
+MIN_BACKGROUND_SNR_DB = 0.0
+# How much of the sources may show up in what the mixture holds beyond them.
+# Measured on built calls with the background 24 dB down: a correct one sits at
+# 0.015, a mixture swapped for another call's at 0.66, one scaled 20% against
+# its sources at 0.97. The limit is deliberately nearer the broken end -- this
+# is a wrong-file test, and the exact-sum check above is what catches small
+# drift wherever the two speakers overlap.
+MAX_RESIDUAL_CORRELATION = 0.5
+
+# Where only one speaker is active, the mixture is that speaker's channel as
+# recorded and the target is the same channel denoised. They are the same voice
+# at the same instant, so they stay strongly correlated: measured on this corpus,
+# original against enhanced speech correlates at 0.997. A floor of 0.8 is
+# generous, and still collapses if mix/s1/s2 come from different calls or the
+# mixture was scaled on its own.
+MIN_SOLO_CORRELATION = 0.8
+
+# How far a file's RMS may drift from the value build recorded before writing it.
+# PCM_16 rounding adds noise ~9e-6 rms, which moves a signal's RMS only to second
+# order (sqrt(r^2 + q^2) - r), so this is loose by orders of magnitude and still
+# a factor of 200 tighter than a 20% rescale.
+RMS_REL_TOLERANCE = 1e-3
+RMS_ABS_TOLERANCE = 1e-6
+
+
+def _erode(mask: np.ndarray, fade: int) -> np.ndarray:
+    """Drop the `fade` samples at each edge of every True run.
+
+    Those are the raised-cosine ramps `build` puts at each mask boundary, where
+    a source sits at partial gain. They have to come out of both checks below:
+    inside a ramp the mixture legitimately differs from the source, and the
+    difference there is a scaled copy of the source itself, which is exactly the
+    thing the correlation test treats as evidence of a broken file.
+
+    A cumulative sum rather than repeated shifts -- a 10 ms fade at 8 kHz is 80
+    samples each way and a call runs to minutes.
+    """
+    if fade <= 0:
+        return mask
+    width = 2 * fade + 1
+    if mask.size < width:
+        return np.zeros_like(mask)
+    counts = np.concatenate(([0], np.cumsum(mask, dtype=np.int64)))
+    eroded = np.zeros_like(mask)
+    eroded[fade : mask.size - fade] = (counts[width:] - counts[:-width]) == width
+    return eroded
+
+
+def _both_at_full_gain(s1: np.ndarray, s2: np.ndarray, fade: int) -> np.ndarray:
+    """Samples where both sources are speech and neither is inside a fade.
+
+    Only there is `mix == s1 + s2` exact when the mixture was built from the raw
+    channels; elsewhere the mixture carries background the targets faded out.
+    """
+    return _erode((s1 != 0.0) & (s2 != 0.0), fade)
+
+
+def _residual_correlation(voices: np.ndarray, residual: np.ndarray) -> float:
+    """|cos| between the sources and what the mixture holds beyond them.
+
+    In a correct raw-channel build the leftover is the *other* channel's
+    background, recorded on a physically isolated line, so it carries no trace
+    of these sources: measured on real calls this sits at a few hundredths.
+
+    Every way the three files can stop describing the same call moves it. If
+    the mixture was scaled without the sources, the leftover is a scaled copy of
+    them and this goes to 1. If the mixture belongs to a different call, or is
+    time-shifted, the leftover contains -(s1 + s2) and it climbs just as far.
+    That makes this the check that survives a call where the two speakers never
+    overlap, which is common at the ~3% natural overlap of this corpus and
+    leaves nothing for the exact-sum test to stand on.
+    """
+    v = voices.astype(np.float64)
+    r = residual.astype(np.float64)
+    scale = float(np.linalg.norm(v) * np.linalg.norm(r))
+    if scale <= 0.0:
+        return 0.0
+    return abs(float(v @ r)) / scale
+
+
+def _check_speaker_caps(cfg, rows, calls_by_speaker) -> list[str]:
+    """Hold the dataset to the caps its selection was made with.
+
+    The caps come from `work/selection.json`, not from config: `select` accepts
+    them on the command line, and a selection made with `--max-calls-per-speaker
+    50` used to be judged here against the config's 3 -- reporting 182 speakers
+    "over the cap" in a selection that was exactly as asked. Config is only the
+    fallback when no selection file is around.
+
+    The duration check sums the `source_speech_sec` that `select` itself admitted
+    against, so the two can never disagree about how speech is measured.
+    """
+    problems: list[str] = []
+    selection = read_json(cfg.paths.selection_json) if cfg.paths.selection_json.exists() else None
+
+    def configured(key):
+        value = selection.get(key) if selection is not None and key in selection else getattr(
+            cfg.select, key
+        )
+        return value if value is not None and value > 0 else None
+
+    max_calls = configured("max_calls_per_speaker")
+    if max_calls is not None:
+        over = {s: n for s, n in calls_by_speaker.items() if n > max_calls}
+        if over:
+            worst = max(over.items(), key=lambda kv: kv[1])
+            problems.append(
+                f"{len(over)} speakers exceed the {max_calls}-call cap "
+                f"(worst: {worst[0]} with {worst[1]})"
+            )
+
+    max_duration = configured("max_duration_per_speaker")
+    if max_duration is None:
+        return problems
+    if selection is None:
+        banner(NAME, "duration cap not checkable: no work/selection.json to read speech from")
+        return problems
+
+    records = selection.get("calls", {})
+    seconds: dict[str, float] = defaultdict(float)
+    unmeasured = 0
+    for row in rows:
+        record = records.get(row["call"])
+        if record is None or "source_speech_sec" not in record:
+            unmeasured += 1
+            continue
+        for speaker, side in zip(record["speakers"], record["source_speech_sec"]):
+            seconds[speaker] += side
+
+    if unmeasured:
+        # A selection made before the field existed is not wrong, just not
+        # checkable -- say so rather than fail every call.
+        banner(
+            NAME,
+            f"duration cap not checkable for {unmeasured} call(s): their selection "
+            "records carry no source_speech_sec (re-run `select --overwrite`)",
+        )
+
+    # `select` admits against these same stored (rounded) values, so the totals
+    # agree exactly; the slack only absorbs float addition in a different order.
+    over = {s: t for s, t in seconds.items() if t > max_duration + 1e-6}
+    if over:
+        worst = max(over.items(), key=lambda kv: kv[1])
+        problems.append(
+            f"{len(over)} speakers exceed the {max_duration / 60:g}-minute speech cap "
+            f"(worst: {worst[0]} with {worst[1] / 60:.1f} min)"
+        )
+    return problems
 
 
 def _check_split_manifests(directory: Path, combined, cfg, what: str) -> list[str]:
@@ -87,11 +247,38 @@ def run(cfg, args) -> None:
     elif args.limit:
         rows = rows[: args.limit]
 
+    # How the dataset was built decides which mixture invariant holds. Absent
+    # or old stats.json -> assume the strict one, which can only be too strict.
+    stats_path = dataset_dir / "stats.json"
+    zerofy_mix = True
+    if stats_path.exists():
+        zerofy_mix = bool(read_json(stats_path).get("mix", {}).get("zerofy_mix", True))
+    # Whether the targets were denoised while the mixture stayed the recording.
+    # Taken from the rows themselves, not config, so a dataset is judged by how
+    # it was built. Absent on anything written before the two were split apart.
+    # The whole manifest, not `rows`: `--sample`/`--limit` may have narrowed that.
+    enhanced_targets = (not zerofy_mix) and any(
+        row.get("enhanced") for row in read_jsonl(manifest_path)
+    )
+    fade = int(round(cfg.sample_rate * cfg.build.fade_ms / 1000.0))
+
     banner(NAME, f"checking {len(rows)} calls under {dataset_dir}")
+    banner(
+        NAME,
+        "mixture is the sum of the two sources"
+        if zerofy_mix
+        else (
+            "mixture is the two channels as recorded; targets are the denoised copy"
+            if enhanced_targets
+            else "mixture is the two channels as recorded; sources are zerofied"
+        ),
+    )
     problems: list[str] = []
 
     # ---- per-call signal checks -------------------------------------- #
     worst_residual = 0.0
+    worst_snr, worst_correlation, unchecked = None, 0.0, 0
+    worst_solo = None
     for row in progress(rows, "verify"):
         call = row["call"]
         try:
@@ -110,10 +297,118 @@ def run(cfg, args) -> None:
             )
             continue
 
-        residual = float(np.abs(mixture[:, 0] - (s1[:, 0] + s2[:, 0])).max())
-        worst_residual = max(worst_residual, residual)
-        if residual > MIX_TOLERANCE:
-            problems.append(f"{call}: mix != s1 + s2 (max residual {residual:.2e})")
+        left, right, mono = s1[:, 0], s2[:, 0], mixture[:, 0]
+
+        # The three files must be the ones build wrote for this call. Checked by
+        # level against the fingerprint in meta.json, because in the
+        # enhanced-target mode nothing else here can see a level error: a
+        # mixture rescaled by 0.8, or swapped for another call carrying the same
+        # voices at a different SIR, still correlates perfectly with its targets.
+        meta_path = dataset_dir / row["split"] / call / "meta.json"
+        recorded = read_json(meta_path).get("rms") if meta_path.exists() else None
+        if recorded:
+            for name, signal in (("mix", mono), ("s1", left), ("s2", right)):
+                got = float(np.sqrt(np.mean(np.square(signal, dtype=np.float64))))
+                want = float(recorded.get(name, got))
+                if abs(got - want) > max(RMS_ABS_TOLERANCE, RMS_REL_TOLERANCE * want):
+                    problems.append(
+                        f"{call}: {name}.wav has rms {got:.6f} where build wrote {want:.6f} "
+                        "-- it is not the file build produced for this call"
+                    )
+        difference = mono - (left + right)
+
+        if zerofy_mix:
+            residual = float(np.abs(difference).max())
+            worst_residual = max(worst_residual, residual)
+            if residual > MIX_TOLERANCE:
+                problems.append(f"{call}: mix != s1 + s2 (max residual {residual:.2e})")
+        elif enhanced_targets:
+            # The mixture is the recording and the targets are its denoised copy,
+            # so no sample of the mixture is the exact sum of the targets, and
+            # what it holds beyond them is background *plus* what the enhancer
+            # removed -- which is correlated with the voices by construction
+            # (measured |corr| mean 0.42, max 0.69). Neither the exact-sum test
+            # nor the leftover-correlation ceiling can apply.
+            #
+            # What still has to be true: wherever exactly one speaker is at full
+            # gain, the mixture is that speaker's channel as recorded and the
+            # target is the same channel denoised -- the same voice at the same
+            # instant. That collapses if the files come from different calls,
+            # are shifted against each other, or the mixture was scaled alone.
+            for name, target, other in (("s1", left, right), ("s2", right, left)):
+                solo = _erode(target != 0.0, fade) & (other == 0.0)
+                if solo.sum() < fade * 4:
+                    continue
+                aligned = _residual_correlation(mono[solo], target[solo])
+                worst_solo = aligned if worst_solo is None else min(worst_solo, aligned)
+                if aligned < MIN_SOLO_CORRELATION:
+                    problems.append(
+                        f"{call}: where only {name} speaks, the mixture and {name} correlate "
+                        f"at {aligned:.2f} (floor {MIN_SOLO_CORRELATION}); they are not "
+                        "the same call, or are shifted against each other"
+                    )
+
+            # Reported, deliberately not enforced. How loud the leftover is here
+            # depends on how much the enhancer changed the speech level, which
+            # is a property of the enhancer rather than of the files: one that
+            # halves its output leaves a leftover exactly as loud as the voices
+            # on a perfectly matched call. The alignment check above is what
+            # catches mismatched files, and it does not care about level.
+            support = _erode(left != 0.0, fade) | _erode(right != 0.0, fade)
+            if support.any():
+                voices = (left + right)[support]
+                noise = float(np.sqrt(np.mean(np.square(difference[support], dtype=np.float64))))
+                level = float(np.sqrt(np.mean(np.square(voices, dtype=np.float64))))
+                if noise > 0.0 and level > 0.0:
+                    snr = float(20.0 * np.log10(level / noise))
+                    worst_snr = snr if worst_snr is None else min(worst_snr, snr)
+        else:
+            # Where both speakers are at full gain the mixture is still exactly
+            # their sum, and that is the check that catches a mismatched or
+            # half-written trio of files. It needs the two to actually overlap
+            # somewhere; calls where they never do are counted and reported
+            # rather than passed over in silence.
+            exact = _both_at_full_gain(left, right, fade)
+            if exact.any():
+                residual = float(np.abs(difference[exact]).max())
+                worst_residual = max(worst_residual, residual)
+                if residual > MIX_TOLERANCE:
+                    problems.append(
+                        f"{call}: mix != s1 + s2 where both speak "
+                        f"(max residual {residual:.2e})"
+                    )
+            else:
+                unchecked += 1
+
+            # Wherever at least one source is at full gain, the rest of the
+            # difference is the other channel's background. Two things have to
+            # be true of it: it sits under the voices, and it looks nothing
+            # like them. The second is what still has teeth on a call where the
+            # speakers never overlap and the exact test above never ran.
+            support = _erode(left != 0.0, fade) | _erode(right != 0.0, fade)
+            if support.any():
+                voices = (left + right)[support]
+                leftover = difference[support]
+                noise = float(np.sqrt(np.mean(np.square(leftover, dtype=np.float64))))
+                level = float(np.sqrt(np.mean(np.square(voices, dtype=np.float64))))
+
+                correlation = _residual_correlation(voices, leftover)
+                worst_correlation = max(worst_correlation, correlation)
+                if correlation > MAX_RESIDUAL_CORRELATION:
+                    problems.append(
+                        f"{call}: what the mixture holds beyond s1 + s2 looks like the "
+                        f"sources themselves (|corr| {correlation:.2f}); mix, s1 and s2 "
+                        "are not the same call, or the mixture was scaled alone"
+                    )
+
+                if noise > 0.0 and level > 0.0:
+                    snr = float(20.0 * np.log10(level / noise))
+                    worst_snr = snr if worst_snr is None else min(worst_snr, snr)
+                    if snr < MIN_BACKGROUND_SNR_DB:
+                        problems.append(
+                            f"{call}: background is louder than the voices "
+                            f"({snr:.1f} dB); mix and sources may not match"
+                        )
 
         # Zerofying must have silenced something on both sides; a source with
         # no exact zeros means the mask was never applied.
@@ -143,17 +438,27 @@ def run(cfg, args) -> None:
             f"{example[1]})"
         )
 
-    cap = cfg.select.max_calls_per_speaker
-    over = {s: n for s, n in calls_by_speaker.items() if n > cap}
-    if over:
-        worst = max(over.items(), key=lambda kv: kv[1])
-        problems.append(
-            f"{len(over)} speakers exceed the {cap}-call cap (worst: {worst[0]} with {worst[1]})"
-        )
+    problems += _check_speaker_caps(cfg, all_rows, calls_by_speaker)
 
     missing = [row["mix"] for row in all_rows if not (dataset_dir / row["mix"]).exists()]
     if missing:
         problems.append(f"{len(missing)} manifest paths do not resolve (e.g. {missing[0]})")
+
+    # The other direction: call directories on disk that no manifest lists.
+    # Anything globbing the tree instead of reading the manifest trains on them.
+    listed = {row["call"] for row in all_rows}
+    orphans = [
+        call_dir
+        for split_dir in sorted(p for p in dataset_dir.iterdir() if p.is_dir() and p.name != "chunks")
+        for call_dir in sorted(p for p in split_dir.iterdir() if p.is_dir())
+        if call_dir.name not in listed
+    ]
+    if orphans:
+        problems.append(
+            f"{len(orphans)} call directories are on disk but in no manifest "
+            f"(e.g. {orphans[0].relative_to(dataset_dir)}) -- usually a `build --limit` "
+            "over a larger earlier build; `build` prunes calls the selection dropped"
+        )
 
     male, female = gender_counts.get("male", 0), gender_counts.get("female", 0)
     if male + female:
@@ -181,6 +486,30 @@ def run(cfg, args) -> None:
     # ---- verdict ------------------------------------------------------ #
     banner(NAME, f"calls in manifest: {len(all_rows)}, unique speakers: {len(calls_by_speaker)}")
     banner(NAME, f"worst mix residual: {worst_residual:.2e} (tolerance {MIX_TOLERANCE:.0e})")
+    if not zerofy_mix:
+        margin = "n/a" if worst_snr is None else f"{worst_snr:.1f} dB"
+        banner(NAME, f"noisiest call: voices {margin} above the background")
+    if enhanced_targets:
+        solo = "n/a" if worst_solo is None else f"{worst_solo:.3f}"
+        banner(
+            NAME,
+            f"weakest mixture/target alignment where one speaker talks alone: {solo} "
+            f"(floor {MIN_SOLO_CORRELATION})",
+        )
+    elif not zerofy_mix:
+        banner(
+            NAME,
+            f"worst source/leftover correlation: {worst_correlation:.3f} "
+            f"(limit {MAX_RESIDUAL_CORRELATION})",
+        )
+        if unchecked:
+            banner(
+                NAME,
+                f"{unchecked} call(s) never have both speakers active at once, so the "
+                "exact sum could not be checked on them; the correlation test above "
+                "covers them instead",
+            )
+    
     if problems:
         banner(NAME, f"FAILED with {len(problems)} problem(s):")
         for problem in problems[:40]:

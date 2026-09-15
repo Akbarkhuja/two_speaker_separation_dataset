@@ -6,8 +6,23 @@ every drop can be explained afterwards.
 1. **Cap per speaker.** A call-centre corpus has a handful of agents opposite
    thousands of one-off customers, so without a cap a few voices would carry
    most of the training set and the model would learn them instead of learning
-   to separate. A call consumes a slot from *both* its speakers, so the cap is
+   to separate. A call draws on the budget of *both* its speakers, so the cap is
    applied greedily, best calls first.
+
+   The budget is **speech time**, not call count. What a model hears of a voice
+   is seconds, and per-side speech in one call ranges from 5 s to ~14 min, so
+   "3 calls" can be fifteen seconds of one person or forty minutes of another.
+   Compared at matched dataset size on the real corpus (~40 h), a 20-minute
+   duration cap kept 23% more calls and 15% more unique speakers than the
+   equivalent call cap, held the loudest voice at exactly 20.0 min instead of
+   31.5, and cut the top-10 speakers' share from 10.8% to 7.5%.
+
+   Seconds are counted as the speaker's own VAD speech minus the `excluded`
+   spans -- the audio of that voice that actually lands in s1/s2. Call
+   wall-clock ran 2.6x-8.3x a side's real speech, and the embedding stage's
+   `speech_sec` undercounts it by 15-39%, so either would make the configured
+   number mean something other than what it says. A call-count cap remains
+   available as a secondary guard.
 
 2. **Gender balance.** Only same-gender calls can move the ratio -- a
    male/female call contributes one side to each -- so the balancing drops the
@@ -27,21 +42,41 @@ import random
 from collections import defaultdict
 
 from ..core.manifest import read_json, write_json
+from ..core.rttm import read_rttm, subtract_intervals
 from .base import banner, require, skip_if_done
 
 NAME = "select"
-REQUIRES = ("filter", "cluster")
+REQUIRES = ("filter", "vad", "cluster")
 
 
 def add_args(parser) -> None:
-    parser.add_argument("--max-calls-per-speaker", type=int)
+    parser.add_argument(
+        "--max-duration-per-speaker",
+        type=float,
+        metavar="SECONDS",
+        help="cap on one speaker's own speech across the selection; 0 turns it off",
+    )
+    parser.add_argument(
+        "--max-calls-per-speaker",
+        type=int,
+        help="cap on one speaker's appearances; 0 turns it off",
+    )
     parser.add_argument("--no-balance-gender", action="store_true", help="skip gender balancing")
     parser.add_argument("--overwrite", action="store_true", help="reselect")
 
 
+def _enabled(value):
+    """A cap of None or <= 0 is off."""
+    return value if value is not None and value > 0 else None
+
+
 def run(cfg, args) -> None:
     require(
-        {"suitable.json": cfg.paths.suitable_json, "speakers.json": cfg.paths.speakers_json},
+        {
+            "suitable.json": cfg.paths.suitable_json,
+            "speakers.json": cfg.paths.speakers_json,
+            "VAD directory": cfg.paths.vad_dir,
+        },
         NAME,
     )
     if skip_if_done(cfg.paths.selection_json, args.overwrite, NAME):
@@ -67,7 +102,18 @@ def run(cfg, args) -> None:
     elif cfg.select.balance_gender and not args.no_balance_gender:
         banner(NAME, "gender.json not found -- balancing skipped")
 
-    max_per_speaker = args.max_calls_per_speaker or cfg.select.max_calls_per_speaker
+    # `is not None`, not `or`: with `or`, passing 0 on the command line falls
+    # through to the config value, so a cap could never be switched off.
+    max_duration = _enabled(
+        args.max_duration_per_speaker
+        if args.max_duration_per_speaker is not None
+        else cfg.select.max_duration_per_speaker
+    )
+    max_calls = _enabled(
+        args.max_calls_per_speaker
+        if args.max_calls_per_speaker is not None
+        else cfg.select.max_calls_per_speaker
+    )
     dropped: dict[str, int] = defaultdict(int)
 
     # ---------------------------------------------------------------- #
@@ -110,6 +156,14 @@ def run(cfg, args) -> None:
             dropped["too_little_speech"] += 1
             continue
 
+        # What the duration cap charges: the speech of each voice that will
+        # actually reach s1/s2. A missing VAD file is a drop, not zero seconds --
+        # zero would let the call slip past any cap for free.
+        source_speech = _source_speech(cfg.paths.vad_dir / f"{call}.rttm", channels, entry)
+        if source_speech is None:
+            dropped["no_vad_rttm"] += 1
+            continue
+
         candidates.append(
             {
                 "call": call,
@@ -122,6 +176,9 @@ def run(cfg, args) -> None:
                 "speakers": speaker_ids,
                 "genders": [gender_by_speaker.get(sid) for sid in speaker_ids],
                 "speech_sec": [round(s, 3) for s in speech],
+                # Per side, in `channels` order; this is what the duration cap
+                # and `verify` count against.
+                "source_speech_sec": [round(s, 3) for s in source_speech],
                 "quality": round(quality, 3),
                 "duration": entry["duration"],
             }
@@ -130,22 +187,25 @@ def run(cfg, args) -> None:
     banner(NAME, f"{len(suitable)} suitable -> {len(candidates)} candidates")
 
     # ---------------------------------------------------------------- #
-    # 1. cap calls per speaker, best calls first
+    # 1. per-speaker caps, best calls first
     # ---------------------------------------------------------------- #
     rng.shuffle(candidates)  # break quality ties without a positional bias
     candidates.sort(key=lambda c: -c["quality"])
 
-    used: dict[str, int] = defaultdict(int)
-    capped = []
-    for record in candidates:
-        if any(used[sid] >= max_per_speaker for sid in record["speakers"]):
-            dropped["speaker_cap"] += 1
-            continue
-        for sid in record["speakers"]:
-            used[sid] += 1
-        capped.append(record)
+    capped, cap_drops, _calls, _seconds = apply_caps(candidates, max_calls, max_duration)
+    for reason, count in cap_drops.items():
+        dropped[reason] += count
 
-    banner(NAME, f"after cap of {max_per_speaker}/speaker: {len(capped)} calls")
+    limits = []
+    if max_duration is not None:
+        limits.append(f"{max_duration / 60:g} min of speech")
+    if max_calls is not None:
+        limits.append(f"{max_calls} calls")
+    banner(
+        NAME,
+        f"after cap of {' and '.join(limits) or 'nothing (caps off)'} per speaker: "
+        f"{len(capped)} calls",
+    )
 
     # ---------------------------------------------------------------- #
     # 2. gender balance
@@ -173,11 +233,19 @@ def run(cfg, args) -> None:
         per_split[record["split"]] += 1
         hours[record["split"]] += record["duration"] / 3600.0
 
+    # Exposure is summarised from the final selection, after gender balancing has
+    # dropped its calls -- the numbers apply_caps returned are from before that.
+    exposure = _exposure(capped)
+
     write_json(
         cfg.paths.selection_json,
         {
             "seed": cfg.seed,
-            "max_calls_per_speaker": max_per_speaker,
+            # The caps actually used, which may differ from config when set on the
+            # command line. `verify` checks against these, not against config.
+            "max_duration_per_speaker": max_duration,
+            "max_calls_per_speaker": max_calls,
+            "exposure": exposure,
             "dropped": dict(dropped),
             "counts": dict(per_split),
             "hours": {k: round(v, 2) for k, v in hours.items()},
@@ -194,7 +262,116 @@ def run(cfg, args) -> None:
             f"[{NAME}]   {split:<6} {per_split.get(split, 0):>6} calls  "
             f"{hours.get(split, 0.0):>7.2f} h"
         )
-    banner(NAME, f"unique speakers used: {len(used)}")
+    banner(
+        NAME,
+        f"unique speakers used: {exposure['speakers']}   loudest voice "
+        f"{exposure['max_sec'] / 60:.1f} min   p99 {exposure['p99_sec'] / 60:.1f} min   "
+        f"top-10 share {exposure['top10_share']:.1%}",
+    )
+
+
+# --------------------------------------------------------------------------- #
+def _source_speech(vad_path, channels: list[int], entry: dict) -> list[float] | None:
+    """Seconds of each side's own speech that will reach s1/s2.
+
+    VAD speech with the `excluded` minor-label spans subtracted, because `build`
+    removes those spans too. `subtract_intervals` merges as it goes, so
+    overlapping VAD segments are not double-counted. Returns None when the VAD
+    RTTM is missing.
+    """
+    if not vad_path.exists():
+        return None
+
+    spans: dict[int, list[tuple[float, float]]] = defaultdict(list)
+    for segment in read_rttm(vad_path):
+        spans[segment.channel - 1].append((segment.start, segment.end))
+
+    excluded = entry.get("excluded", {})
+    seconds = []
+    for channel in channels:
+        cut = [tuple(span) for span in excluded.get(str(channel), [])]
+        kept = subtract_intervals(spans.get(channel, []), cut)
+        seconds.append(sum(end - start for start, end in kept))
+    return seconds
+
+
+def apply_caps(
+    candidates: list[dict],
+    max_calls: int | None,
+    max_duration: float | None,
+) -> tuple[list[dict], dict[str, int], dict[str, int], dict[str, float]]:
+    """Admit calls in the given order while every speaker stays within budget.
+
+    Returns (kept, dropped_reasons, calls_by_speaker, seconds_by_speaker).
+    A cap of None is off. Each candidate needs `speakers` and, when the duration
+    cap is on, `source_speech_sec` in the same order.
+
+    Admission is **strict**: a call is kept only if it leaves both speakers
+    within the duration budget. Admitting while a speaker is merely *under*
+    budget lets the last call overshoot by its full length -- simulated on the
+    real corpus, a 5-minute cap let the loudest voice reach 10.5 minutes.
+
+    Three drop reasons, deliberately distinct so a selection explains itself:
+
+      longer_than_duration_cap  one side is longer than the cap on its own, so
+                                no budget could ever admit it
+      speaker_cap               a speaker has used up their calls
+      speaker_duration_cap      admitting would push a speaker past their time
+    """
+    kept: list[dict] = []
+    dropped: dict[str, int] = defaultdict(int)
+    calls: dict[str, int] = {}
+    seconds: dict[str, float] = {}
+
+    for record in candidates:
+        sides = record.get("source_speech_sec") or [0.0] * len(record["speakers"])
+        reason = None
+        for speaker, side in zip(record["speakers"], sides):
+            if max_duration is not None and side > max_duration:
+                reason = "longer_than_duration_cap"
+                break
+            # `.get`, never `defaultdict[...]`: a lookup here must not register a
+            # speaker who ends up with nothing admitted.
+            if max_calls is not None and calls.get(speaker, 0) >= max_calls:
+                reason = "speaker_cap"
+                break
+            if max_duration is not None and seconds.get(speaker, 0.0) + side > max_duration:
+                reason = "speaker_duration_cap"
+                break
+
+        if reason is not None:
+            dropped[reason] += 1
+            continue
+
+        for speaker, side in zip(record["speakers"], sides):
+            calls[speaker] = calls.get(speaker, 0) + 1
+            seconds[speaker] = seconds.get(speaker, 0.0) + side
+        kept.append(record)
+
+    return kept, dict(dropped), calls, seconds
+
+
+def _exposure(records: list[dict]) -> dict:
+    """How concentrated the selected speech is on its loudest voices."""
+    seconds: dict[str, float] = defaultdict(float)
+    for record in records:
+        sides = record.get("source_speech_sec") or record.get("speech_sec") or []
+        for speaker, side in zip(record["speakers"], sides):
+            seconds[speaker] += side
+
+    values = sorted(seconds.values(), reverse=True)
+    total = sum(values)
+    if not values:
+        return {"speakers": 0, "max_sec": 0.0, "p99_sec": 0.0, "top10_share": 0.0, "hours": 0.0}
+
+    p99_index = min(len(values) - 1, int(round(0.01 * (len(values) - 1))))
+    return {
+        "speakers": len(values),
+        "max_sec": round(values[0], 3),
+        "p99_sec": round(values[p99_index], 3),
+        "top10_share": round(sum(values[:10]) / total, 4) if total else 0.0,
+        "hours": round(total / 3600.0, 3),
+    }
 
 
 # --------------------------------------------------------------------------- #

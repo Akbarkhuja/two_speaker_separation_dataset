@@ -1,8 +1,13 @@
 # dual_separation_dataset
 
 Turns dual-channel telephony recordings into a 2-speaker separation dataset:
-one mixture plus two ground-truth source signals per call, with
-`mix == s1 + s2` holding sample-for-sample.
+one mixture plus two ground-truth source signals per call. **The mixture is always
+the two original `.opus` channels summed**, so it keeps the noise floor, the room
+and the telephone line exactly as recorded. The two targets are each speaker's own
+channel — denoised, when the `enhance` stage has run — with everything outside
+their speech faded out. The model's input is a real call; its outputs are clean
+speech. `build.zerofy_mix=true` gives the strict `mix == s1 + s2` dataset instead,
+the one mode where the mixture is built from the targets.
 
 The corpus works for this because **the two parties sit on physically isolated
 channels**. Measured across 158 calls, cross-channel `|corr|` is mean 0.0006 /
@@ -68,7 +73,7 @@ with a warning when `work/gender.json` is absent, so the chain still completes.
 ## Tests
 
 ```bash
-python tests/smoke.py             # 50 checks in ~4 s. No GPU, no network, no weights.
+python tests/smoke.py             # 62 checks in ~6 s. No GPU, no network, no weights.
 python tests/smoke.py --real 10   # additionally: 10 real calls through the real models
 python tests/smoke.py --only fade # run checks matching a substring
 ```
@@ -108,9 +113,9 @@ diarize -> filter -> vad -> embed -> cluster -> gender -> select -> enhance -> b
 | `embed` | `work/embeddings.npz`, `work/embed_index.json` | One TitaNet-L vector per speaker per call, duration-weighted. |
 | `cluster` | `work/speakers.json` | Global speaker identities via constrained complete-linkage AHC. |
 | `gender` | `work/gender.json` | Male/female per global speaker, for balancing. |
-| `select` | `work/selection.json` | Speaker cap, gender balance, speaker-disjoint splits. |
+| `select` | `work/selection.json` | Per-speaker **speech-time** cap, gender balance, speaker-disjoint splits. |
 | `enhance` | `work/enhanced/<call>.flac` | Denoises both channels via the MossFormerGAN service, **before** they are summed. Optional but cached. |
-| `build` | `dataset/` | Zerofy, shift, level, sum. Writes the wavs, manifests and `stats.json`. |
+| `build` | `dataset/` | Mixture from the **original** channels; targets from the enhanced (or original) channels, zerofied. Shift and SIR are applied to both copies alike. Prunes call directories the selection dropped. |
 
 ### Output layout
 
@@ -198,11 +203,35 @@ after**, with 781 calls still shifted and overlap unchanged (mean 0.264, 99.9% i
 202 that decline are calls whose recording starts or ends mid-speech, where no offset is
 safe; `meta.json` records `shift_reason` and `stats.json` counts them.
 
-**`mix == s1 + s2` is the invariant everything rests on.** When anything clips,
-all three signals are scaled by the same factor — scaling only the mixture would
-break the identity that every separation loss assumes. `verify` asserts it at
-`1e-4`, which is the PCM_16 quantization floor (three independently rounded
-files, ~1.5 LSB); observed worst case is `3.05e-05`.
+**The mixture is formed before zerofying, not after.** Summing two channels that
+had already been zerofied gave a mixture that was digitally silent whenever
+nobody was talking — a signal that occurs in no real call, and one a model finds
+long before it finds the voices. `build` now sums the channels as recorded and
+zerofies only the targets, so the input carries the line noise, the room and the
+breath between the turns while `s1`/`s2` hold speech alone. That is the ordinary
+"noisy mixture, clean targets" setup: the model is asked to separate *and* clean
+up, which is what it will have to do in production anyway.
+
+The cost is the exact identity. `mix - (s1 + s2)` is now precisely the removed
+background — on the corpus it sits 20–40 dB under the voices, and `meta.json`
+records `background_snr_db` per call. Set `build.zerofy_mix: true` to get the
+old behaviour back, where the mixture is the sum of the two zerofied channels
+and `mix == s1 + s2` holds sample-for-sample.
+
+**What `verify` checks depends on which of those you built.** It reads the mode
+from `stats.json`. Under `zerofy_mix` it asserts the full identity at `1e-4`,
+the PCM_16 quantization floor (three independently rounded files, ~1.5 LSB;
+observed worst case `3.05e-05`). Otherwise it asserts two things: the identity
+still holds exactly wherever both speakers are at full gain, and what the
+mixture holds beyond `s1 + s2` does not *look* like `s1 + s2`. The second test
+is the one that matters, because at ~3% natural overlap plenty of calls have no
+sample where both speakers are active. It works because the leftover should be
+the other channel's background, recorded on a physically isolated line: a
+correct call measures `|corr| ≈ 0.015`, a mixture swapped in from another call
+`0.66`, a mixture scaled 20% against its sources `0.97`. The limit is `0.5`.
+
+Either way, when anything clips all three signals are scaled by the same factor.
+Scaling only the mixture would change the level the model has to reproduce.
 
 The peak guard covers **all three signals, not just the mixture**. A source can
 exceed full scale while the sum does not: `scale_to_sir` pushes s2 well above 1.0
@@ -215,12 +244,21 @@ the mixture sat exactly at the 0.99 ceiling.
 **Zerofying fades its edges.** Hard-zeroing at every VAD boundary leaves a click
 correlated perfectly with the label, and a separation model will learn the
 clicks instead of the voices. `build.fade_ms` (10 ms) applies a raised-cosine
-taper at each edge.
+taper at each edge. The same taper covers the one join a circular `--shuffle`
+roll creates inside the file: on a zerofied channel both sides of it were exact
+zeros, but on a raw channel they are two unrelated samples of noise floor, and a
+step at a fixed offset is its own learnable artifact.
+
+**Spans excluded as a possible third voice leave the mixture too.** They are cut
+from the *channel*, not just from the VAD mask. Now that the mixture is not the
+sum of the targets, removing such a span from `s1`/`s2` alone would leave an
+unlabelled voice in the model's input with no target to match it — worse than
+the short gap that cutting it leaves behind.
 
 **Enhancement runs before the sum, and in its own stage.** Speech enhancement is
 non-linear, so `enhance(s1 + s2) != enhance(s1) + enhance(s2)` — it has to be applied to
-the two isolated channels and the mixture formed afterwards, or `mix == s1 + s2` stops
-holding. It is a separate stage rather than part of `build` because throughput is fixed at
+the two isolated channels and the mixture formed afterwards, or the sources stop being
+the mixture's speech content. It is a separate stage rather than part of `build` because throughput is fixed at
 **~3.2x realtime and does not improve with concurrency** (measured 3.17x / 3.28x / 3.27x at
 1 / 4 / 8 workers: one replica, adaptive batch cap 1), while `build` is the stage you re-run
 most. Only the VAD speech spans are sent — everything else is zerofied by `build` anyway —
@@ -228,6 +266,50 @@ which takes the selected set from ~44 h to **~22 h**. The service returns 8 kHz 
 `output_sample_rate` is omitted, and length is preserved exactly, so every VAD offset stays
 valid; verified on real audio, the untouched 65% of a call differs by at most half a PCM_16
 LSB while speech differs by ~120.
+
+**`mix.wav` comes from the original audio, never the enhanced copy.** An earlier
+build read one file for both halves of the pair, so once `enhance` had run the
+*mixture* was denoised too — measured, a built `mix.wav` matched the enhanced
+`.flac` to the PCM_16 floor (corr 1.000000) and differed from the `.opus` by up to
+0.78. Enhancing the model's input throws away the very noise it has to learn to
+cope with. `build` now reads both files: the mixture from the `.opus`, the targets
+from the cache. Everything done to channel 2 — the roll, its seam taper and the
+SIR gain — is applied to both copies, or the mixture and the target stop
+describing the same signal. `meta.json` records `mix_source` and `target_source`
+separately.
+
+This costs the exact sum: `mix - (s1 + s2)` holds the background *and* whatever the
+enhancer removed, which correlates with the voices (mean 0.42, max 0.69 over 12
+calls). So `verify` checks this mode differently — where one speaker talks alone,
+the mixture and that target must correlate above 0.8 (measured 0.993), and every
+file's RMS must match the fingerprint `build` recorded, which is what catches a
+rescaled or swapped mixture that correlation alone cannot see.
+
+**Speakers are capped by speech time, not call count.** What a model hears of a voice
+is seconds, and one side of one call carries anywhere from 5 s to ~14 min — so a call count
+bounds nothing. `select.max_duration_per_speaker` (default 1200 s) caps each voice's own
+speech: its VAD speech minus `excluded` spans, i.e. exactly what lands in `s1`/`s2`. Call
+wall-clock would overcharge a quiet speaker 2.6–8.3x, and the embedding stage's `speech_sec`
+undercounts by 15–39%. Admission is strict — a call is kept only if it leaves both speakers
+within budget. Compared at matched size on the real corpus:
+
+| ~size | cap | calls | speakers | loudest voice | top-10 share |
+|---|---|---|---|---|---|
+| 15 h | calls ≤ 3 | 253 | 312 | 11.8 min | 10.3% |
+| 15 h | speech ≤ 5 min | 317 | 372 | 5.0 min | 6.2% |
+| 40 h | calls ≤ 15 | 1082 | 853 | 31.5 min | 10.8% |
+| 40 h | speech ≤ 20 min | 1328 | 979 | 20.0 min | 7.5% |
+
+`max_calls_per_speaker` is still available as a secondary cap (default off).
+
+**The cap also decides whether the splits work.** Speaker-disjoint splitting can only divide
+the speaker graph along its connected components, and speakers who appear in many calls
+glue it into one. On the real corpus the largest component holds **99.1% of selected calls
+at a 20-minute cap** (splits 910 / 4 / 4) and 95.3% at 15 minutes — but **32.2% at 10
+minutes**, where the splits land at 393 / 23 / 22, essentially the 90/5/5 target. It is a
+sharp threshold, not a gradual one: cutting the busiest voice from 26 calls to 11 is what
+stops the graph percolating. If `dev`/`test` come out with a handful of calls, tighten the
+cap before anything else.
 
 **Splits are speaker-disjoint by construction.** Calls are edges between two
 global speakers, and whole connected components go to one split. A per-call

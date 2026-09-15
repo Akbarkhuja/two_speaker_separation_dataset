@@ -175,7 +175,16 @@ class GenderConfig:
 
 @dataclass
 class SelectConfig:
-    max_calls_per_speaker: int = 3
+    # Seconds of one speaker's own speech -- VAD speech minus `excluded` spans,
+    # exactly what lands in s1/s2 -- allowed across the whole selection. This is
+    # the primary cap: what a model hears of a voice is time, not call count, and
+    # per-side speech in one call ranges from 5 s to ~14 min. Measured at matched
+    # size (~40 h), a 20-minute cap kept 23% more calls and 15% more speakers than
+    # the equivalent call cap, and held the loudest voice at 20.0 min instead of
+    # 31.5. `null` or <= 0 turns it off.
+    max_duration_per_speaker: float | None = 1200.0
+    # Optional secondary cap on appearances. `null` or <= 0 turns it off.
+    max_calls_per_speaker: int | None = None
     balance_gender: bool = True
     # Tolerated deviation from 50/50 before the majority class is downsampled.
     gender_tolerance: float = 0.02
@@ -215,12 +224,29 @@ class BuildConfig:
     # does not, so a half-enhanced dataset cannot be built by accident; 'never'
     # ignores the cache.
     use_enhanced: str = "auto"
+    # What goes into mix.wav.
+    #   False (default) -- the two channels as recorded are summed, so the
+    #     background between the turns survives into the model's input while
+    #     the targets stay clean. `mix == s1 + s2` no longer holds: the
+    #     difference is exactly that background.
+    #   True -- both channels are zerofied first and the mixture is their sum,
+    #     which makes `mix == s1 + s2` exact but leaves the model's input
+    #     digitally silent whenever nobody is talking.
+    # The targets s1/s2 are zerofied either way.
+    zerofy_mix: bool = False
     # Raised-cosine fade at every VAD mask edge. Hard zeroing leaves a click at
     # each boundary that correlates perfectly with the label, and a separation
     # model will learn the clicks instead of the voices.
     fade_ms: float = 10.0
+    # Overlap boosting. Off by default: rolling s2 rearranges the call in time
+    # to manufacture overlap, which is exactly what makes a built call sound
+    # shuffled rather than like a recorded conversation. With it off every call
+    # is left as recorded and `natural_frac` / `target_overlap` /
+    # `seam_guard_ms` below are unused.
+    shuffle: bool = False
     # Fraction of calls left exactly as recorded (~3% natural overlap); the
-    # rest get s2 shifted to land inside `target_overlap`.
+    # rest get s2 shifted to land inside `target_overlap`. Only consulted when
+    # `shuffle` is on.
     natural_frac: float = 0.6
     target_overlap: tuple[float, float] = (0.15, 0.60)
     # The shift is circular, so it wraps somewhere. Only offsets whose wrap

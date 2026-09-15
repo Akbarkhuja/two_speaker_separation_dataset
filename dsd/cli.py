@@ -55,6 +55,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--limit", type=int, help="passed to every stage that accepts it")
     run_parser.add_argument("--overwrite", action="store_true", help="passed to every stage")
     run_parser.add_argument("--chunks", action="store_true", help="build fixed-length windows too")
+    run_parser.add_argument(
+        "--shuffle",
+        action="store_true",
+        help="build: roll s2 to synthesize speech overlap (off by default)",
+    )
 
     for module in ORDER:
         stage_parser = subparsers.add_parser(module.NAME, help=(module.__doc__ or "").split("\n")[0])
@@ -124,7 +129,7 @@ def _run_pipeline(cfg, args, parser) -> int:
         stage_parser = argparse.ArgumentParser(prog=name, add_help=False)
         module.add_args(stage_parser)
         stage_args = stage_parser.parse_args([])
-        for shared in ("limit", "overwrite", "chunks"):
+        for shared in ("limit", "overwrite", "chunks", "shuffle"):
             if hasattr(stage_args, shared) and getattr(args, shared, None):
                 setattr(stage_args, shared, getattr(args, shared))
         _run_stage(module, cfg, stage_args)

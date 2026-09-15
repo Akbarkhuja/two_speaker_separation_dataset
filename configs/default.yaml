@@ -106,8 +106,13 @@ gender:
 # 7. select -> work/selection.json
 # --------------------------------------------------------------------------- #
 select:
-  max_calls_per_speaker: 3
-  balance_gender: true
+  # Seconds of a speaker's own speech (VAD minus excluded spans) allowed across
+  # the whole selection -- the primary guard against a few voices dominating.
+  # Admission is strict: a call is kept only if both speakers stay within it.
+  max_duration_per_speaker: 1200.0
+  # Optional secondary cap on appearances; null turns it off.
+  max_calls_per_speaker: null
+  balance_gender: false
   gender_tolerance: 0.02
   min_speech_sec: 5.0
   splits:
@@ -129,7 +134,7 @@ enhance:
   context_sec: 0.5           # run-in context per span, trimmed off before splicing
   min_span_sec: 0.3
   format: flac               # cache container; lossless at PCM_16, ~half of WAV
-  workers: 2
+  workers: 1
   options:
     http_mossformergan:
       # Where mossformergan_serve actually runs. Note this is also moss_http's
@@ -146,8 +151,25 @@ build:
   # missing, so a half-enhanced dataset cannot be built by accident.  never:
   # ignore the cache.
   use_enhanced: auto
+  # use_enhanced only ever affects s1/s2. mix.wav is built from the original
+  # .opus channels regardless -- the model's input is the call as recorded.
+  #
+  # What goes into mix.wav.
+  #   false -- sum the two ORIGINAL channels as recorded, so the room, the line
+  #            noise and everything between the turns stays in the model's input.
+  #            s1/s2 are zerofied (and denoised, when enhanced audio is used).
+  #   true  -- zerofy the two target channels first and sum those, making
+  #            mix == s1 + s2 exact. This is the one mode where the mixture is
+  #            built from the targets rather than from the original recording.
+  zerofy_mix: false
   fade_ms: 10.0              # raised-cosine taper at every VAD mask edge
-  natural_frac: 0.6          # share of calls left exactly as recorded
+  # Overlap boosting: roll s2 in time to manufacture overlap. On here; the roll
+  # moves speech around the file, which is what makes a built call sound
+  # rearranged rather than recorded. Override for one run with
+  # `python -m dsd build --no-shuffle` (or `--shuffle` when this is false).
+  # natural_frac, target_overlap and seam_guard_ms below only apply when it is on.
+  shuffle: false
+  natural_frac: 0.7          # share of calls left exactly as recorded
   target_overlap: [0.15, 0.60]
   # The shift wraps circularly. Only offsets whose wrap seams land in this much
   # silence are used, so an utterance is never cut in half with its two halves

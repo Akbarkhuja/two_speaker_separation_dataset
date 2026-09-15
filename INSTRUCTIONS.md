@@ -117,9 +117,9 @@ diarize → filter → vad → embed → cluster → gender → select → enhan
 | 4 | `embed` | `work/suitable.json`, `work/vad/` | `work/embeddings.npz`, `work/embed_index.json` |
 | 5 | `cluster` | `work/embeddings.npz` | `work/speakers.json` |
 | 6 | `gender` | `work/suitable.json`, `work/vad/`, `work/speakers.json` | `work/gender.json` |
-| 7 | `select` | `work/suitable.json`, `work/speakers.json`, `work/gender.json`\* | `work/selection.json` |
+| 7 | `select` | `work/suitable.json`, `work/vad/`, `work/speakers.json`, `work/gender.json`\* | `work/selection.json` |
 | 8 | `enhance` | `work/selection.json`, `work/vad/`, audio | `work/enhanced/<call>.flac` |
-| 9 | `build` | `work/selection.json`, `work/vad/`, enhanced or raw audio | `dataset/**`, `manifest.jsonl` + `<split>.jsonl`, `stats.json` |
+| 9 | `build` | `work/selection.json`, `work/vad/`, original audio (mixture) + enhanced or original audio (targets) | `dataset/**`, `manifest.jsonl` + `<split>.jsonl`, `stats.json` |
 | — | `verify` | `dataset/manifest.jsonl` | nothing; exit code only |
 
 \* optional — see §5.
@@ -316,8 +316,12 @@ python -m dsd verify
 python -m dsd --set build.natural_frac=0.3 --set build.target_overlap='[0.2,0.7]' \
               build --overwrite --chunks
 
-# Cap each speaker at one call and re-split, keeping everything upstream
-python -m dsd select --overwrite --max-calls-per-speaker 1
+# Cap each speaker at 10 minutes of their own speech and re-split. On this corpus
+# 10 min is where dev/test stop collapsing (393/23/22 vs 910/4/4 at 20 min).
+python -m dsd select --overwrite --max-duration-per-speaker 600
+
+# Either cap can be switched off with 0; both may be on at once
+python -m dsd select --overwrite --max-duration-per-speaker 0 --max-calls-per-speaker 5
 python -m dsd build --overwrite --chunks
 
 # Everything except gender, because the Docker service is not running
@@ -343,9 +347,9 @@ get its own options.
 | `embed` | ✓ | ✓ | – | `--backend` |
 | `cluster` | – | ✓ | – | `--backend` `--threshold` `--report` |
 | `gender` | ✓ | ✓ | – | `--backend` `--base-url` `--workers` |
-| `select` | – | ✓ | – | `--max-calls-per-speaker` `--no-balance-gender` |
+| `select` | – | ✓ | – | `--max-duration-per-speaker SECONDS` `--max-calls-per-speaker` `--no-balance-gender` |
 | `enhance` | ✓ | ✓ | – | `--backend` `--base-url` `--regions {speech,full}` `--workers` |
-| `build` | ✓ | ✓ | ✓ | — |
+| `build` | ✓ | ✓ | ✓ | `--shuffle` / `--no-shuffle` `--no-prune` |
 | `verify` | ✓ | – | – | `--sample N` |
 
 > `--limit N` is applied by each stage **independently**, to its own input. With

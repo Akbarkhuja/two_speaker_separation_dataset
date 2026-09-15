@@ -52,6 +52,7 @@ from dsd.core import rttm as R  # noqa: E402
 from dsd.core.manifest import read_json, read_jsonl  # noqa: E402
 from dsd.mixing import chunker, mixer, overlap  # noqa: E402
 from dsd.registry import EMBEDDERS, ENHANCERS, GENDER, VADS, Registry  # noqa: E402
+from dsd.stages import verify as verify_stage  # noqa: E402
 
 SR = 8000
 
@@ -211,6 +212,56 @@ def fade_envelope_degenerate_masks():
     # A fade longer than the signal must still stay in range.
     envelope = A.fade_envelope(A.speech_mask([(0.0, 0.01)], 100, SR), SR, 500.0)
     assert envelope.min() >= 0.0 and envelope.max() <= 1.0
+
+
+@check("unit")
+def erode_drops_exactly_the_fade_ramps():
+    # The middle run is 10 ms -- shorter than a fade either side, so it goes.
+    mask = A.speech_mask([(1.0, 2.0), (4.0, 4.01), (6.0, 9.0)], 10 * SR, SR)
+    fade = int(0.01 * SR)
+    eroded = verify_stage._erode(mask, fade)
+
+    assert not (eroded & ~mask).any(), "erosion may only remove samples"
+    runs = np.flatnonzero(np.diff(np.concatenate(([0], mask.view(np.int8), [0]))))
+    for start, stop in zip(runs[::2], runs[1::2]):
+        length = stop - start
+        expected = max(0, length - 2 * fade)
+        assert int(eroded[start:stop].sum()) == expected, (
+            f"run of {length} samples kept {int(eroded[start:stop].sum())}, want {expected}"
+        )
+    assert not eroded[int(4.0 * SR) : int(4.01 * SR)].any(), "a sub-fade run must vanish"
+    return f"fade {fade} samples, 3 runs"
+
+
+@check("unit")
+def residual_correlation_tells_background_from_a_mismatched_mixture():
+    """The check that still works when the two speakers never overlap.
+
+    A correct raw-channel build leaves the *other* channel's background, which
+    is an independent recording. Every way the trio can stop matching leaves a
+    copy of the sources instead.
+    """
+    rng = np.random.default_rng(3)
+    n = 8 * SR
+    voices = rng.normal(0, 0.2, n)
+    background = rng.normal(0, 0.2 * 10 ** (-24 / 20), n)  # 24 dB down, independent
+
+    honest = verify_stage._residual_correlation(voices, background)
+    assert honest < 0.1, f"independent background should not correlate ({honest:.3f})"
+
+    # The peak guard scaling the mixture and not the sources.
+    for error in (0.05, 0.20):
+        leftover = -error * voices + background
+        got = verify_stage._residual_correlation(voices, leftover)
+        assert got > verify_stage.MAX_RESIDUAL_CORRELATION, (
+            f"a {error:.0%} scale error only reached {got:.3f}"
+        )
+
+    # A mixture belonging to a different call.
+    other = rng.normal(0, 0.2, n)
+    swapped = verify_stage._residual_correlation(voices, other - voices)
+    assert swapped > verify_stage.MAX_RESIDUAL_CORRELATION, swapped
+    return f"honest {honest:.3f}, swapped {swapped:.3f}"
 
 
 # --------------------------------------------------------------------------- #
@@ -569,6 +620,61 @@ def split_manifests_keep_unconfigured_splits_and_refuse_manifest():
             assert "manifest.jsonl" in str(exc), str(exc)
         else:
             raise AssertionError("a split named 'manifest' must be refused")
+
+
+# --------------------------------------------------------------------------- #
+# [unit] per-speaker caps
+# --------------------------------------------------------------------------- #
+def _cap_candidate(name, a, b, seconds_a, seconds_b):
+    return {"call": name, "speakers": [a, b], "source_speech_sec": [seconds_a, seconds_b]}
+
+
+@check("unit")
+def duration_cap_is_strict_at_the_boundary():
+    from dsd.stages.select import apply_caps
+
+    calls = [
+        _cap_candidate("c1", "agent", "x", 40.0, 30.0),
+        _cap_candidate("c2", "agent", "y", 20.0, 30.0),  # agent -> exactly 60: admitted
+        _cap_candidate("c3", "agent", "z", 0.001, 5.0),  # one millisecond over: refused
+        _cap_candidate("c4", "w", "v", 61.0, 5.0),       # longer than the cap on its own
+    ]
+    kept, dropped, used_calls, used_seconds = apply_caps(calls, None, 60.0)
+
+    assert [r["call"] for r in kept] == ["c1", "c2"], [r["call"] for r in kept]
+    assert approx(used_seconds["agent"], 60.0), used_seconds["agent"]
+    assert dropped == {"speaker_duration_cap": 1, "longer_than_duration_cap": 1}, dropped
+    # A refused call must not register its speakers at all.
+    assert "z" not in used_seconds and "w" not in used_seconds and "v" not in used_calls
+    return "exactly-at-cap in, 1 ms over out"
+
+
+@check("unit")
+def caps_combine_and_switch_off():
+    from dsd.stages.select import apply_caps
+
+    rng = random.Random(3)
+    calls = [
+        _cap_candidate(f"c{i}", f"s{rng.randrange(6)}", f"t{i}", rng.uniform(5, 90), 10.0)
+        for i in range(200)
+    ]
+
+    kept, dropped, _, _ = apply_caps(calls, None, None)
+    assert len(kept) == len(calls) and not dropped, "both caps off must keep everything"
+
+    kept, dropped, used_calls, _ = apply_caps(calls, 4, None)
+    assert max(used_calls.values()) <= 4 and set(dropped) == {"speaker_cap"}, dropped
+
+    kept, dropped, used_calls, used_seconds = apply_caps(calls, 4, 180.0)
+    assert max(used_calls.values()) <= 4
+    assert max(used_seconds.values()) <= 180.0 + 1e-9, max(used_seconds.values())
+    # Recomputed from what was kept, independently of the function's own tally.
+    totals: dict[str, float] = {}
+    for record in kept:
+        for speaker, side in zip(record["speakers"], record["source_speech_sec"]):
+            totals[speaker] = totals.get(speaker, 0.0) + side
+    assert max(totals.values()) <= 180.0 + 1e-9
+    return f"{len(kept)}/200 kept under both caps, {dict(dropped)}"
 
 
 # --------------------------------------------------------------------------- #
@@ -1014,6 +1120,18 @@ MINOR_SPAN = (12.0, 12.6)
 MINOR_FREQ = 620.0
 
 
+# The noise floor planted between the turns, ~35 dB under the tones. Without it
+# every channel is digitally silent outside its bursts, the two mixing modes
+# produce byte-identical output, and nothing here can tell them apart -- which
+# is the whole thing `build` now does differently.
+ROOM_NOISE = 0.004
+
+
+def _room(rng: np.random.Generator) -> np.ndarray:
+    """A call-length two-channel bed of noise for the tones to be painted onto."""
+    return (ROOM_NOISE * rng.standard_normal((int(CALL_SEC * SR), 2))).astype(np.float32)
+
+
 def _tone(freq: float, samples: int, rng: np.random.Generator) -> np.ndarray:
     t = np.arange(samples) / SR
     wave = np.sin(2 * np.pi * freq * t) + 0.3 * np.sin(2 * np.pi * 2 * freq * t)
@@ -1045,7 +1163,7 @@ def build_corpus(root: Path) -> dict:
         ]
 
     for call, (left, right) in GOOD_CALLS.items():
-        data = np.zeros((int(CALL_SEC * SR), 2), dtype=np.float32)
+        data = _room(rng)
         _paint(data, 0, CH0_BURSTS, VOICES[left], rng)
         _paint(data, 1, CH1_BURSTS, VOICES[right], rng)
         segments = turns(0, CH0_BURSTS) + turns(1, CH1_BURSTS)
@@ -1057,7 +1175,7 @@ def build_corpus(root: Path) -> dict:
         emit(call, segments, data)
 
     # Rejected on purpose: a second speaker well past both thresholds.
-    data = np.zeros((int(CALL_SEC * SR), 2), dtype=np.float32)
+    data = _room(rng)
     _paint(data, 0, CH0_BURSTS[:2], VOICES["A"], rng)
     _paint(data, 0, [(15.0, 24.0)], VOICES["C"], rng)
     _paint(data, 1, CH1_BURSTS, VOICES["B"], rng)
@@ -1068,7 +1186,7 @@ def build_corpus(root: Path) -> dict:
     )
 
     # Rejected on purpose: channel 1 never speaks.
-    data = np.zeros((int(CALL_SEC * SR), 2), dtype=np.float32)
+    data = _room(rng)
     _paint(data, 0, CH0_BURSTS, VOICES["A"], rng)
     emit("reject_silent_channel", turns(0, CH0_BURSTS), data)
 
@@ -1137,7 +1255,9 @@ enhance:
   workers: 1
 build:
   use_enhanced: auto
+  zerofy_mix: false
   fade_ms: 10.0
+  shuffle: true
   natural_frac: 0.0
   target_overlap: [0.15, 0.60]
   sir_db: [-5.0, 5.0]
@@ -1310,23 +1430,154 @@ def splits_are_speaker_disjoint_and_all_populated():
     return " ".join(f"{name}={selection['counts'][name]}" for name in sorted(selection["counts"]))
 
 
+def _built_trio(root: Path, row: dict):
+    mixture, sr = A.read_audio(root / "dataset" / row["mix"])
+    s1, _ = A.read_audio(root / "dataset" / row["s1"])
+    s2, _ = A.read_audio(root / "dataset" / row["s2"])
+    assert sr == SR
+    assert len(mixture) == len(s1) == len(s2)
+    return mixture[:, 0], s1[:, 0], s2[:, 0]
+
+
 @check("e2e")
-def built_sources_sum_to_the_mixture():
+def built_sources_sum_to_the_mixture_where_both_speak():
+    """The invariant of a build whose targets are NOT denoised.
+
+    With `use_enhanced=never` the mixture and the targets come from the same
+    original channels, so wherever both speakers are at full gain the mixture is
+    still exactly their sum. (With denoised targets it cannot be -- see
+    `mixture_is_the_original_and_targets_are_enhanced`.)
+    """
+    fixture = e2e_fixture()
+    root = fixture["root"]
+    fade = int(0.01 * SR)
+    fixture["run"]("--set", "build.use_enhanced=never", "build", "--chunks")
+    try:
+        rows = list(read_jsonl(root / "dataset" / "manifest.jsonl"))
+        assert len(rows) == len(GOOD_CALLS)
+        assert not any(row["enhanced"] for row in rows), "targets should be raw here"
+
+        worst, checked = 0.0, 0
+        for row in rows:
+            mixture, s1, s2 = _built_trio(root, row)
+            exact = verify_stage._both_at_full_gain(s1, s2, fade)
+            if not exact.any():
+                continue
+            checked += 1
+            worst = max(worst, float(np.abs((mixture - (s1 + s2))[exact]).max()))
+        assert checked, "no call had the two speakers overlapping; fixture is wrong"
+        assert worst < 1e-4, f"mix != s1 + s2 where both speak (worst {worst:.2e})"
+        fixture["run"]("--set", "build.use_enhanced=never", "verify")
+        return f"{checked} calls, worst residual {worst:.1e}"
+    finally:
+        fixture["run"]("build", "--chunks")
+
+
+@check("e2e")
+def the_mixture_keeps_the_background_the_targets_drop():
+    """The point of building the mixture before zerofying.
+
+    Between the turns the targets are exact zeros and the mixture is not: it
+    still holds the room the microphones recorded. Asserted on the built wavs,
+    at a moment the corpus plants no speech on either channel.
+    """
     fixture = e2e_fixture()
     root = fixture["root"]
     rows = list(read_jsonl(root / "dataset" / "manifest.jsonl"))
-    assert len(rows) == len(GOOD_CALLS)
 
-    worst = 0.0
+    # 27.9-30.0 s: past the last burst on either channel in the planted corpus.
+    quiet = slice(int(28.2 * SR), int(29.8 * SR))
+    floors = []
     for row in rows:
-        mixture, sr = A.read_audio(root / "dataset" / row["mix"])
-        s1, _ = A.read_audio(root / "dataset" / row["s1"])
-        s2, _ = A.read_audio(root / "dataset" / row["s2"])
-        assert sr == SR
-        assert len(mixture) == len(s1) == len(s2)
-        worst = max(worst, float(np.abs(mixture[:, 0] - (s1[:, 0] + s2[:, 0])).max()))
-    assert worst < 1e-4, f"mix != s1 + s2 (worst residual {worst:.2e})"
+        mixture, s1, s2 = _built_trio(root, row)
+        assert float(np.abs(s1[quiet]).max()) == 0.0, f"{row['call']}: s1 is not zerofied"
+        assert float(np.abs(s2[quiet]).max()) == 0.0, f"{row['call']}: s2 is not zerofied"
+        floor = float(np.sqrt(np.mean(mixture[quiet] ** 2)))
+        assert floor > 0.25 * ROOM_NOISE, (
+            f"{row['call']}: the mixture is silent between the turns (rms {floor:.5f}) -- "
+            "it was built from the zerofied channels"
+        )
+        floors.append(floor)
+
+    meta = read_json(root / "dataset" / rows[0]["split"] / rows[0]["call"] / "meta.json")
+    assert meta["zerofy_mix"] is False
+    if meta["targets_enhanced"]:
+        # With denoised targets, mix - (s1 + s2) also holds what the enhancer
+        # removed, so it is not "just background" and has no fixed floor.
+        assert meta["background_snr_db"] is not None
+    else:
+        assert meta["background_snr_db"] > 10.0, meta["background_snr_db"]
+    return f"noise floor {min(floors):.4f}..{max(floors):.4f} rms in the mixture"
+
+
+@check("e2e")
+def zerofy_mix_restores_the_exact_sum():
+    """The escape hatch still produces a dataset where mix == s1 + s2."""
+    fixture = e2e_fixture()
+    root = fixture["root"]
+    try:
+        fixture["run"]("--set", "build.zerofy_mix=true", "build", "--chunks")
+        rows = list(read_jsonl(root / "dataset" / "manifest.jsonl"))
+        worst = 0.0
+        for row in rows:
+            mixture, s1, s2 = _built_trio(root, row)
+            worst = max(worst, float(np.abs(mixture - (s1 + s2)).max()))
+        assert worst < 1e-4, f"zerofy_mix should sum exactly (worst {worst:.2e})"
+
+        meta = read_json(root / "dataset" / rows[0]["split"] / rows[0]["call"] / "meta.json")
+        assert meta["zerofy_mix"] is True
+        assert meta["background_rms"] == 0.0, meta["background_rms"]
+        # Switching modes must rebuild without --overwrite; a cached call from
+        # the other mode would leave the dataset half one thing, half the other.
+        assert read_json(root / "dataset" / "stats.json")["mix"]["zerofy_mix"] is True
+        fixture["run"]("verify")
+    finally:
+        # Put the fixture back for the checks that run after this one.
+        fixture["run"]("build", "--chunks")
     return f"worst residual {worst:.1e}"
+
+
+@check("e2e")
+def verify_rejects_a_mixture_that_does_not_match_its_sources():
+    """The teeth verify keeps now that `mix == s1 + s2` is not a blanket test.
+
+    Run against a build with overlap boosting off, which is the shipped default
+    and the hard case: the planted corpus has the two speakers strictly taking
+    turns, so there is not one sample where both are active and the exact-sum
+    check has nothing to stand on.
+    """
+    fixture = e2e_fixture()
+    root = fixture["root"]
+
+    def verify_fails(what: str) -> None:
+        try:
+            fixture["run"]("verify")
+        except (AssertionError, SystemExit):
+            return
+        raise AssertionError(f"verify passed on {what}")
+
+    try:
+        fixture["run"]("--set", "build.shuffle=false", "build", "--chunks")
+        rows = list(read_jsonl(root / "dataset" / "manifest.jsonl"))
+        assert all(row["overlap"] == 0.0 for row in rows), "fixture should have no overlap"
+        fixture["run"]("verify")  # the honest build passes
+
+        target = root / "dataset" / rows[0]["mix"]
+        backup = target.read_bytes()
+        try:
+            shutil.copyfile(root / "dataset" / rows[1]["mix"], target)
+            verify_fails("a mix.wav swapped in from another call")
+
+            target.write_bytes(backup)
+            mixture, sr = A.read_audio(target)
+            A.write_wav(target, mixture * 0.8, sr)
+            verify_fails("a mixture scaled away from its sources")
+        finally:
+            target.write_bytes(backup)
+    finally:
+        # Put the fixture back for the checks that run after this one.
+        fixture["run"]("build", "--chunks")
+    return "swap and rescale both caught with zero overlap to lean on"
 
 
 @check("e2e")
@@ -1355,6 +1606,13 @@ def excluded_span_is_silent_in_the_built_source():
     # ...and the speaker's real speech is still there, so nothing over-subtracted.
     burst = int(CH0_BURSTS[1][0] * sr) + margin, int(CH0_BURSTS[1][1] * sr) - margin
     assert float(np.abs(channel[burst[0] : burst[1]]).max()) > 0.01, "real speech went missing"
+
+    # And it is gone from the mixture as well. The mixture is no longer the sum
+    # of the two targets, so a span removed only from them would still reach
+    # the model -- an unlabelled third voice in its input.
+    mixture, _ = A.read_audio(root / "dataset" / rows["call01"]["mix"])
+    peak = float(np.abs(mixture[start:end, 0]).max())
+    assert peak < 4 * ROOM_NOISE, f"the excluded span survives in the mixture (peak {peak:.4f})"
 
 
 @check("e2e")
@@ -1485,6 +1743,82 @@ def natural_frac_one_leaves_every_call_as_recorded():
 
 
 @check("e2e")
+def selection_charges_speech_minus_excluded_spans():
+    """call01 and call02 share voice A on channel 0; only call01 carries the planted
+    minor-label span there. Charged speech must match, not differ by that span."""
+    fixture = e2e_fixture()
+    selection = read_json(fixture["root"] / "work" / "selection.json")
+    records = selection["calls"]
+    assert {"call01", "call02"} <= set(records), sorted(records)
+
+    with_span = records["call01"]["source_speech_sec"][0]
+    clean = records["call02"]["source_speech_sec"][0]
+    span = MINOR_SPAN[1] - MINOR_SPAN[0]
+    assert abs(with_span - clean) < 0.1, (
+        f"call01 charged {with_span:.2f}s vs {clean:.2f}s for the same voice -- "
+        f"the {span:.1f}s excluded span was not subtracted"
+    )
+
+    vad_total = sum(
+        segment.duration
+        for segment in R.read_rttm(fixture["root"] / "work" / "vad" / "call01.rttm")
+        if segment.channel == 1
+    )
+    assert abs((vad_total - with_span) - span) < 0.1, (
+        f"VAD {vad_total:.2f}s minus charged {with_span:.2f}s should be the {span:.1f}s span"
+    )
+    assert selection["max_duration_per_speaker"] is not None
+    return f"charged {with_span:.2f}s = VAD {vad_total:.2f}s - {span:.1f}s excluded"
+
+
+@check("e2e")
+def duration_cap_is_enforced():
+    """Each voice speaks ~10 s per call across two calls; a 15 s cap fits exactly one."""
+    fixture = e2e_fixture()
+    selection_path = fixture["root"] / "work" / "selection.json"
+    backup = selection_path.read_bytes()
+    try:
+        fixture["run"]("select", "--overwrite", "--max-duration-per-speaker", "15")
+        selection = read_json(selection_path)
+
+        totals: dict[str, float] = {}
+        for record in selection["calls"].values():
+            for speaker, side in zip(record["speakers"], record["source_speech_sec"]):
+                totals[speaker] = totals.get(speaker, 0.0) + side
+        assert totals, "nothing selected under a 15 s cap"
+        assert max(totals.values()) <= 15.0 + 1e-6, f"cap violated: {max(totals.values()):.2f}s"
+        assert len(selection["calls"]) == len(PAIRS), (
+            f"expected one call per voice pair, kept {len(selection['calls'])}"
+        )
+        assert selection["dropped"].get("speaker_duration_cap", 0) == len(PAIRS)
+        assert selection["max_duration_per_speaker"] == 15.0
+
+        # verify must hold the dataset to *this* selection's caps, not config's.
+        exposure = selection["exposure"]
+        assert exposure["max_sec"] <= 15.0 + 1e-6, exposure
+        return f"{len(selection['calls'])} calls kept, loudest voice {exposure['max_sec']:.1f}s"
+    finally:
+        selection_path.write_bytes(backup)
+
+
+@check("e2e")
+def duration_cap_zero_switches_it_off():
+    """0 on the command line disables a cap -- `args.x or cfg.x` used to swallow it."""
+    fixture = e2e_fixture()
+    selection_path = fixture["root"] / "work" / "selection.json"
+    backup = selection_path.read_bytes()
+    try:
+        fixture["run"]("select", "--overwrite", "--max-duration-per-speaker", "0",
+                       "--max-calls-per-speaker", "0")
+        selection = read_json(selection_path)
+        assert selection["max_duration_per_speaker"] is None, selection["max_duration_per_speaker"]
+        assert selection["max_calls_per_speaker"] is None, selection["max_calls_per_speaker"]
+        assert len(selection["calls"]) == len(GOOD_CALLS), len(selection["calls"])
+    finally:
+        selection_path.write_bytes(backup)
+
+
+@check("e2e")
 def speaker_cap_is_enforced():
     fixture = e2e_fixture()
     # selection.json is shared with the other e2e checks, so it is restored after.
@@ -1577,28 +1911,101 @@ def enhancement_touched_speech_and_left_the_rest_alone():
 
 
 @check("e2e")
+def mixture_is_the_original_and_targets_are_enhanced():
+    """The bug this guards: mix.wav used to be built from the enhanced audio.
+
+    The stub enhancer halves every sample it touches. So where only one speaker
+    talks, the mixture is that channel as recorded and the target is half of it,
+    and the least-squares gain of the mixture onto the target is exactly
+    1 / 0.5 = 2.0. Built from the enhanced audio instead it would be 1.0.
+
+    Checked on *both* speakers of every call. The fixture rolls every call and
+    draws a random SIR, both applied to channel 2 only, so the second speaker
+    comes out at 2.0 only if the mixture copy and the target copy of that
+    channel were rolled and scaled identically.
+    """
+    fixture = e2e_fixture()
+    root = fixture["root"]
+    fade = int(0.01 * SR)
+    expected = 1.0 / StubEnhancer.GAIN
+
+    gains = []
+    for row in read_jsonl(root / "dataset" / "manifest.jsonl"):
+        mixture, s1, s2 = _built_trio(root, row)
+        for name, target, other in (("s1", s1, s2), ("s2", s2, s1)):
+            solo = verify_stage._erode(target != 0.0, fade) & (other == 0.0)
+            assert solo.sum() > SR // 4, f"{row['call']}: no solo stretch for {name}"
+            t = target[solo].astype(np.float64)
+            gain = float(np.dot(mixture[solo], t) / np.dot(t, t))
+            assert abs(gain - expected) < 0.05, (
+                f"{row['call']} {name}: mixture is {gain:.3f}x the target where only "
+                f"{name} speaks; expected {expected:.1f}x -- "
+                + ("the mixture was built from the enhanced audio" if abs(gain - 1.0) < 0.05
+                   else "the mixture and target copies of this channel diverged")
+            )
+            gains.append(gain)
+    return f"{len(gains)} solo stretches, gain {min(gains):.3f}..{max(gains):.3f} (expect 2.0)"
+
+
+@check("e2e")
+def build_prunes_calls_the_selection_dropped():
+    fixture = e2e_fixture()
+    root = fixture["root"]
+    stray = root / "dataset" / "train" / "call_not_in_any_selection"
+    selected = {p.name for p in (root / "dataset").glob("*/call*") if p.is_dir()}
+
+    def plant():
+        stray.mkdir(parents=True, exist_ok=True)
+        (stray / "mix.wav").write_bytes(b"stale")
+
+    try:
+        plant()
+        fixture["run"]("build", "--chunks")
+        assert not stray.exists(), "build left a call the selection does not hold"
+
+        plant()
+        fixture["run"]("build", "--chunks", "--no-prune")
+        assert stray.exists(), "--no-prune must keep it"
+        # ...and verify must notice a directory no manifest lists.
+        try:
+            fixture["run"]("verify")
+        except (AssertionError, SystemExit):
+            pass
+        else:
+            raise AssertionError("verify passed with a call directory in no manifest")
+
+        # A --limit build is partial on purpose; it must not delete the calls it
+        # merely skipped.
+        shutil.rmtree(stray)
+        fixture["run"]("build", "--chunks", "--limit", "2")
+        still = {p.name for p in (root / "dataset").glob("*/call*") if p.is_dir()}
+        assert still == selected, f"--limit deleted selected calls: {sorted(selected - still)}"
+    finally:
+        shutil.rmtree(stray, ignore_errors=True)
+        fixture["run"]("build", "--chunks")
+    return "stray pruned, --no-prune kept it, --limit deleted nothing"
+
+
+@check("e2e")
 def build_uses_the_enhanced_cache():
     fixture = e2e_fixture()
-    rows = list(read_jsonl(fixture["root"] / "dataset" / "manifest.jsonl"))
+    root = fixture["root"]
+    rows = list(read_jsonl(root / "dataset" / "manifest.jsonl"))
     assert rows and all(row["enhanced"] for row in rows), (
-        "every built call should have come from the enhanced cache"
+        "every built call should have its targets from the enhanced cache"
     )
 
-    stats = read_json(fixture["root"] / "dataset" / "stats.json")["enhanced"]
+    stats = read_json(root / "dataset" / "stats.json")["enhanced"]
     assert stats["calls"] == stats["of"] == len(rows), stats
     assert stats["backend"] == "stub"
 
-    meta = read_json(
-        fixture["root"] / "dataset" / rows[0]["split"] / rows[0]["call"] / "meta.json"
-    )
-    assert meta["enhanced"] is True and meta["enhance_backend"] == "stub"
-    # The whole point: enhancing the sources before summing keeps the identity.
-    mixture, _ = A.read_audio(fixture["root"] / "dataset" / rows[0]["mix"])
-    s1, _ = A.read_audio(fixture["root"] / "dataset" / rows[0]["s1"])
-    s2, _ = A.read_audio(fixture["root"] / "dataset" / rows[0]["s2"])
-    residual = float(np.abs(mixture[:, 0] - (s1[:, 0] + s2[:, 0])).max())
-    assert residual < 1e-4, f"mix != s1 + s2 after enhancement (residual {residual:.2e})"
-    return f"{len(rows)} calls, residual {residual:.1e}"
+    meta = read_json(root / "dataset" / rows[0]["split"] / rows[0]["call"] / "meta.json")
+    assert meta["targets_enhanced"] is True and meta["enhance_backend"] == "stub"
+    assert "/work/enhanced/" in meta["target_source"], meta["target_source"]
+    # The mixture is never taken from the cache.
+    assert "/work/enhanced/" not in meta["mix_source"], meta["mix_source"]
+    assert "/corpus/" in meta["mix_source"], meta["mix_source"]
+    return f"{len(rows)} calls, targets from the cache, mixture from the corpus"
 
 
 @check("e2e")

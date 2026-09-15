@@ -29,6 +29,37 @@ def scale_to_sir(
     return (s2 * gain).astype(np.float32), gain
 
 
+def guard_peaks(
+    mixture: np.ndarray,
+    s1: np.ndarray,
+    s2: np.ndarray,
+    ceiling: float = 0.99,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Scale all three signals by one factor so none of them clips.
+
+    Separate from `mix` because the mixture is not always the sum of the two
+    targets: when it is built from the channels as recorded it also carries the
+    background between the turns, and that background can be what pushes it
+    over the ceiling. One shared factor either way -- scaling the mixture on
+    its own would change the level the model has to reproduce.
+    """
+    mixture = np.asarray(mixture, dtype=np.float32)
+    peak = 0.0
+    for signal in (mixture, s1, s2):
+        if signal.size:
+            peak = max(peak, float(np.abs(signal).max()))
+    if peak <= ceiling or peak == 0.0:
+        return mixture, s1, s2, 1.0
+
+    gain = ceiling / peak
+    return (
+        (mixture * gain).astype(np.float32),
+        (s1 * gain).astype(np.float32),
+        (s2 * gain).astype(np.float32),
+        gain,
+    )
+
+
 def mix(
     s1: np.ndarray,
     s2: np.ndarray,
@@ -49,18 +80,4 @@ def mix(
     with residuals to 1.06e-01 against a 1e-4 tolerance, every one of them a
     negative-SIR call whose s2 was pinned at full scale.
     """
-    mixture = (s1 + s2).astype(np.float32)
-    peak = 0.0
-    for signal in (mixture, s1, s2):
-        if signal.size:
-            peak = max(peak, float(np.abs(signal).max()))
-    if peak <= ceiling or peak == 0.0:
-        return mixture, s1, s2, 1.0
-
-    gain = ceiling / peak
-    return (
-        (mixture * gain).astype(np.float32),
-        (s1 * gain).astype(np.float32),
-        (s2 * gain).astype(np.float32),
-        gain,
-    )
+    return guard_peaks((s1 + s2).astype(np.float32), s1, s2, ceiling)
