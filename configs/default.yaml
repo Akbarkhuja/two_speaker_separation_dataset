@@ -144,7 +144,33 @@ enhance:
       retries: 3
 
 # --------------------------------------------------------------------------- #
-# 9. build -> dataset/
+# 9. augment -> work/augment/
+# --------------------------------------------------------------------------- #
+# Prepares the degradation assets `build` draws from when it writes degraded
+# copies of the mixture. Runs once and caches; `build` is re-run constantly and
+# must not pay for simulating 2000 rooms or screening 6000 noise clips again.
+# Both source corpora live in the sibling diar_syn_dataset project and are read
+# only here. Set either to null to build the bank without it.
+augment:
+  # 270 impulse responses from the MIT Acoustical Reverberation Scene Statistics
+  # Survey, already peak-aligned at 16 kHz. Resampled to 8 kHz into work/augment/irs/.
+  ir_dir: /home/akbar/craft/diar_syn_dataset/data/augmentation_data/ir_aligned
+  # WHAM!: 28,000 clips, 81.7 h of recorded ambience.
+  noise_dir: /home/akbar/craft/diar_syn_dataset/data/augmentation_data/wham_noise
+  # A list of clips already found free of speech, from the sibling project.
+  # Importing it skips a VAD pass over thousands of files; when it is missing
+  # the stage screens them itself and caches the answer.
+  noise_screen_json: /home/akbar/craft/diar_syn_dataset/data/synthethic_data/synthetic_diar_uzbekvoice_v4/bed_screen.json
+  max_noise_speech_frac: 0.05
+  screen_limit: 6000
+  # Simulated shoebox rooms, reproducible from `seed`. 0 disables them.
+  simulated_rirs: 2000
+  rt60: [0.1, 1.0]           # seconds, as the paper
+  room_dim: [2.0, 20.0]      # metres per side, as the paper
+  ir_max_sec: 1.0
+
+# --------------------------------------------------------------------------- #
+# 10. build -> dataset/
 # --------------------------------------------------------------------------- #
 build:
   # auto: use work/enhanced/<call> when present.  always: fail when it is
@@ -175,9 +201,56 @@ build:
   # silence are used, so an utterance is never cut in half with its two halves
   # at opposite ends of the file.
   seam_guard_ms: 200.0
+  # This is also DialogueSidon's seventh step. Its mixing weight `w ~ U(0.3,0.7)`
+  # in `x = w*y1 + (1-w)*y2` is an SIR of 20*log10(w/(1-w)), i.e. +-7.36 dB, so
+  # the augmentation chain deliberately does NOT re-randomise level -- that would
+  # do it twice. Set [-7.36, 7.36] to reproduce the paper's distribution exactly.
   sir_db: [-5.0, 5.0]
   peak_ceiling: 0.99
   chunks: false
   chunk_sec: 4.0
   chunk_hop: 2.0
   min_active_per_src: 0.5
+
+  # ------------------------------------------------------------------------- #
+  # DialogueSidon-style degradation (arXiv:2604.09344, Appendix A).
+  #
+  # Each variant is a degraded copy of the mixture written beside the clean one
+  # as mix_aug<k>.wav. The two channels are degraded INDEPENDENTLY and then
+  # summed -- they are two telephone legs, each with its own line and handset --
+  # and s1/s2 are never degraded, so the pair the model trains on is
+  # (degraded mixture, clean targets).
+  #
+  # The paper runs its pipeline four times per session, which is how 2,225.9 h
+  # became ~8,902 h. `variants: 0` writes only mix.wav, exactly as before.
+  # Requires `python -m dsd augment` to have built the banks first.
+  augment:
+    variants: 4
+    prob: 0.5                # per degradation, per track -- the paper's p
+    reverb:
+      # Simulated rooms are unlimited but shoebox-shaped; the 270 measured ones
+      # have reflections a shoebox cannot produce but are few enough to memorise.
+      simulated_frac: 0.5
+    noise:
+      snr_db: [-5.0, 20.0]
+    band_limit:
+      # The paper resamples to {8,16,22.05,24,44.1,48} kHz and back. Every one of
+      # those is at or above this corpus's 8 kHz, so the round trip is an
+      # identity here -- 99.9% of the energy in these calls is already below
+      # 3.8 kHz. A cutoff below Nyquist is the step that actually applies.
+      cutoff_hz: [2500.0, 3800.0]
+    clip:
+      low_pct: [0.0, 10.0]
+      high_pct: [90.0, 100.0]
+    codec:
+      # The paper uses MP3 at 65-245 kbps, which is ~25 dB SNR on 8 kHz mono and
+      # barely a degradation -- and the sources are .opus already. These are the
+      # codecs a real call goes through. Measured round-trip SNR on this corpus:
+      # mulaw 37.3, alaw 37.5, gsm 10.7, opus 3.9 (8 kbps) to 25.9 (24 kbps).
+      # Add "mp3" here to include the paper's codec as well.
+      kinds: [mulaw, alaw, gsm, opus]
+      opus_kbps: [6, 24]
+      mp3_kbps: [65, 245]
+    packet_loss:
+      frac: 0.09             # share of segments zeroed, as the paper
+      segment_ms: [20.0, 200.0]

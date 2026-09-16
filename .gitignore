@@ -1,10 +1,13 @@
 Datasets/
 dataset/
-work/
+work*/
 work_mono/
 tutorials/
 
+configs/default.yaml
+
 */checkpoints/
+models/
 
 __pycache__/
 *.pyc

@@ -10,6 +10,7 @@ off disk and is run on demand, not as part of building.
 """
 
 from . import (
+    augment,
     build,
     cluster,
     diarize,
@@ -31,6 +32,7 @@ ORDER = [
     gender,
     select,
     enhance,
+    augment,
     build,
     verify,
 ]

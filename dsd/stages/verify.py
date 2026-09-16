@@ -62,6 +62,14 @@ MIN_SOLO_CORRELATION = 0.8
 RMS_REL_TOLERANCE = 1e-3
 RMS_ABS_TOLERANCE = 1e-6
 
+# How far a degraded variant may fall below the correlation `build` measured
+# between it and the clean mixture when it wrote it. The absolute value is not
+# checkable here -- a variant that drew noise at -5 dB SNR legitimately sits near
+# 0.3, one that drew nothing at all sits at 1.0 -- so what is checked is that the
+# file on disk still matches the number recorded for it. A tolerance rather than
+# equality because both files are quantized to PCM_16 independently.
+VARIANT_CORRELATION_TOLERANCE = 0.02
+
 
 def _erode(mask: np.ndarray, fade: int) -> np.ndarray:
     """Drop the `fade` samples at each edge of every True run.
@@ -118,6 +126,102 @@ def _residual_correlation(voices: np.ndarray, residual: np.ndarray) -> float:
     return abs(float(v @ r)) / scale
 
 
+def _check_variants(
+    dataset_dir: Path,
+    call: str,
+    clean: np.ndarray,
+    variant_rows: list[dict],
+    meta: dict,
+    sample_rate: int,
+    ceiling: float,
+) -> list[str]:
+    """Check the degraded copies of one call's mixture.
+
+    None of the three mixture invariants above can apply here. A degraded
+    variant has been through a room, a noise recording at down to -5 dB SNR, a
+    codec and a packet dropper, so it is neither the sum of its targets nor
+    strongly correlated with them -- by design. Enforcing a correlation floor
+    against s1/s2 would fail precisely the variants that degraded the most,
+    which is the opposite of what a check should do.
+
+    What is still true, and is what gets checked:
+
+      - it is the same length, at the same rate, as the clean mixture;
+      - its RMS is the one `build` recorded before writing it;
+      - its correlation with the clean mixture is the one `build` measured.
+        That single number is what makes this a real check: it is the only
+        quantity that moves if the file is from another call, is time-shifted,
+        was rescaled, or was written from a different recipe than the one
+        meta.json claims -- and unlike an absolute floor it stays valid whether
+        the recipe degraded the signal heavily or not at all;
+      - nothing in it is non-finite, and nothing exceeds the peak ceiling.
+    """
+    problems: list[str] = []
+    items = {
+        item["index"]: item for item in meta.get("augment", {}).get("items", [])
+    }
+
+    for row in variant_rows:
+        index = row["variant"]
+        name = Path(row["mix"]).name
+        try:
+            data, sr = read_audio(dataset_dir / row["mix"])
+        except Exception as exc:
+            problems.append(f"{call}: {name} unreadable ({exc})")
+            continue
+
+        signal = data[:, 0]
+        if sr != sample_rate or signal.size != clean.size:
+            problems.append(
+                f"{call}: {name} is {signal.size} samples @ {sr} Hz, but the clean "
+                f"mixture is {clean.size} @ {sample_rate}"
+            )
+            continue
+
+        if not np.all(np.isfinite(signal)):
+            problems.append(f"{call}: {name} contains non-finite samples")
+            continue
+        peak = float(np.abs(signal).max())
+        if peak > ceiling + 1e-3:
+            problems.append(f"{call}: {name} peaks at {peak:.4f}, above the {ceiling} ceiling")
+        if peak == 0.0:
+            problems.append(f"{call}: {name} is entirely silent")
+            continue
+
+        item = items.get(index)
+        if item is None:
+            problems.append(
+                f"{call}: the manifest lists variant {index} but meta.json does not "
+                "describe it -- the manifest and the call directory disagree"
+            )
+            continue
+
+        got = float(np.sqrt(np.mean(np.square(signal, dtype=np.float64))))
+        want = float(item.get("rms", got))
+        if abs(got - want) > max(RMS_ABS_TOLERANCE, RMS_REL_TOLERANCE * want):
+            problems.append(
+                f"{call}: {name} has rms {got:.6f} where build wrote {want:.6f} "
+                "-- it is not the file build produced for this variant"
+            )
+
+        if "correlation" in item:
+            measured = _residual_correlation(clean, signal)
+            expected = float(item["correlation"])
+            if abs(measured - expected) > VARIANT_CORRELATION_TOLERANCE:
+                problems.append(
+                    f"{call}: {name} correlates with mix.wav at {measured:.3f} where "
+                    f"build measured {expected:.3f} -- it is not the variant build "
+                    "wrote for this call"
+                )
+
+    listed = {row["variant"] for row in variant_rows}
+    for index in sorted(set(items) - listed):
+        problems.append(
+            f"{call}: meta.json describes variant {index} but no manifest row names it"
+        )
+    return problems
+
+
 def _check_speaker_caps(cfg, rows, calls_by_speaker) -> list[str]:
     """Hold the dataset to the caps its selection was made with.
 
@@ -159,8 +263,12 @@ def _check_speaker_caps(cfg, rows, calls_by_speaker) -> list[str]:
     records = selection.get("calls", {})
     seconds: dict[str, float] = defaultdict(float)
     unmeasured = 0
-    for row in rows:
-        record = records.get(row["call"])
+    # Distinct calls, not rows. With augmentation on a call appears once per
+    # degraded variant plus once clean, and counting rows would multiply every
+    # speaker's speech by that factor -- reporting a selection that is exactly
+    # as `select` admitted it as five times over its own cap.
+    for name in dict.fromkeys(row["call"] for row in rows):
+        record = records.get(name)
         if record is None or "source_speech_sec" not in record:
             unmeasured += 1
             continue
@@ -216,9 +324,10 @@ def _check_split_manifests(directory: Path, combined, cfg, what: str) -> list[st
         )
 
     # Compare identities, not just counts -- equal totals with the wrong members
-    # is exactly what a stale file looks like.
-    key = (lambda r: r["mix"]) if what == "chunks" else (lambda r: r["call"])
-    missing = {key(r) for r in combined} - {key(r) for r in seen}
+    # is exactly what a stale file looks like. Keyed on the mixture path rather
+    # than the call: a call now contributes one row per degraded variant, and
+    # only the mixture path tells those rows apart.
+    missing = {r["mix"] for r in combined} - {r["mix"] for r in seen}
     if missing:
         problems.append(
             f"{what}: {len(missing)} in the combined manifest are in no split file "
@@ -239,13 +348,24 @@ def run(cfg, args) -> None:
     manifest_path = dataset_dir / "manifest.jsonl"
     require({"manifest.jsonl": manifest_path}, NAME)
 
-    rows = list(read_jsonl(manifest_path))
+    all_rows = list(read_jsonl(manifest_path))
+
+    # Rows are grouped by call before anything else. With augmentation on, a
+    # call is a clean mixture plus one row per degraded variant, all sharing the
+    # same s1/s2. Sampling then picks whole calls rather than rows, so a variant
+    # is never checked without the clean mixture it is measured against, and the
+    # shared targets are read once instead of once per variant.
+    by_call: dict[str, list[dict]] = defaultdict(list)
+    for row in all_rows:
+        by_call[row["call"]].append(row)
+
+    names = list(by_call)
     if args.sample:
         import random
 
-        rows = random.Random(cfg.seed).sample(rows, min(args.sample, len(rows)))
+        names = random.Random(cfg.seed).sample(names, min(args.sample, len(names)))
     elif args.limit:
-        rows = rows[: args.limit]
+        names = names[: args.limit]
 
     # How the dataset was built decides which mixture invariant holds. Absent
     # or old stats.json -> assume the strict one, which can only be too strict.
@@ -256,13 +376,18 @@ def run(cfg, args) -> None:
     # Whether the targets were denoised while the mixture stayed the recording.
     # Taken from the rows themselves, not config, so a dataset is judged by how
     # it was built. Absent on anything written before the two were split apart.
-    # The whole manifest, not `rows`: `--sample`/`--limit` may have narrowed that.
-    enhanced_targets = (not zerofy_mix) and any(
-        row.get("enhanced") for row in read_jsonl(manifest_path)
-    )
+    # The whole manifest, not the sample: `--sample`/`--limit` may have narrowed it.
+    enhanced_targets = (not zerofy_mix) and any(row.get("enhanced") for row in all_rows)
+    n_variants = sum(1 for row in all_rows if row.get("variant") is not None)
     fade = int(round(cfg.sample_rate * cfg.build.fade_ms / 1000.0))
 
-    banner(NAME, f"checking {len(rows)} calls under {dataset_dir}")
+    banner(NAME, f"checking {len(names)} calls under {dataset_dir}")
+    if n_variants:
+        banner(
+            NAME,
+            f"{n_variants:,} degraded variant rows: checked against the clean mixture "
+            "they were derived from, not against s1 + s2",
+        )
     banner(
         NAME,
         "mixture is the sum of the two sources"
@@ -279,8 +404,13 @@ def run(cfg, args) -> None:
     worst_residual = 0.0
     worst_snr, worst_correlation, unchecked = None, 0.0, 0
     worst_solo = None
-    for row in progress(rows, "verify"):
-        call = row["call"]
+    for call in progress(names, "verify"):
+        call_rows = by_call[call]
+        # The clean mixture is the row every other row for this call is judged
+        # against. A dataset built with `variants` but no clean row is not one
+        # this pipeline produces, so fall back rather than skip the call.
+        row = next((r for r in call_rows if r.get("variant") is None), call_rows[0])
+        variant_rows = [r for r in call_rows if r.get("variant") is not None]
         try:
             mixture, sr = read_audio(dataset_dir / row["mix"])
             s1, sr1 = read_audio(dataset_dir / row["s1"])
@@ -305,7 +435,8 @@ def run(cfg, args) -> None:
         # mixture rescaled by 0.8, or swapped for another call carrying the same
         # voices at a different SIR, still correlates perfectly with its targets.
         meta_path = dataset_dir / row["split"] / call / "meta.json"
-        recorded = read_json(meta_path).get("rms") if meta_path.exists() else None
+        meta = read_json(meta_path) if meta_path.exists() else {}
+        recorded = meta.get("rms")
         if recorded:
             for name, signal in (("mix", mono), ("s1", left), ("s2", right)):
                 got = float(np.sqrt(np.mean(np.square(signal, dtype=np.float64))))
@@ -410,6 +541,29 @@ def run(cfg, args) -> None:
                             f"({snr:.1f} dB); mix and sources may not match"
                         )
 
+        # ---- degraded variants ---------------------------------------- #
+        if variant_rows:
+            problems += _check_variants(
+                dataset_dir, call, mono, variant_rows, meta, cfg.sample_rate,
+                cfg.build.peak_ceiling,
+            )
+
+        # The other direction, and the reason `build` deletes these itself: a
+        # rebuild with fewer variants leaves the extra files in a directory the
+        # selection still holds, so nothing prunes them. They are invisible to a
+        # manifest reader and picked up by anything that globs.
+        named = {Path(r["mix"]).name for r in call_rows}
+        extra = [
+            path.name
+            for path in sorted((dataset_dir / row["split"] / call).glob("mix_aug*.wav"))
+            if path.name not in named
+        ]
+        if extra:
+            problems.append(
+                f"{call}: {len(extra)} degraded mixture(s) on disk that no manifest row "
+                f"names (e.g. {extra[0]}) -- left by a build with more variants"
+            )
+
         # Zerofying must have silenced something on both sides; a source with
         # no exact zeros means the mask was never applied.
         for name, source in (("s1", s1[:, 0]), ("s2", s2[:, 0])):
@@ -419,11 +573,15 @@ def run(cfg, args) -> None:
                 problems.append(f"{call}: {name} is entirely silent")
 
     # ---- dataset-level checks ---------------------------------------- #
-    all_rows = list(read_jsonl(manifest_path))
+    # Folded to one entry per call first. A speaker's call count and the gender
+    # balance are properties of the calls, not of how many degraded copies of
+    # each mixture happen to be on disk; counting rows would inflate both by the
+    # variant count and make the cap check fire on a correct dataset.
+    unique_rows = list({row["call"]: row for row in all_rows}.values())
     splits_by_speaker: dict[str, set] = defaultdict(set)
     calls_by_speaker: dict[str, int] = defaultdict(int)
     gender_counts: dict[str, int] = defaultdict(int)
-    for row in all_rows:
+    for row in unique_rows:
         for speaker in row["speakers"]:
             splits_by_speaker[speaker].add(row["split"])
             calls_by_speaker[speaker] += 1
@@ -484,7 +642,12 @@ def run(cfg, args) -> None:
         banner(NAME, f"chunks: {len(chunk_rows)} rows")
 
     # ---- verdict ------------------------------------------------------ #
-    banner(NAME, f"calls in manifest: {len(all_rows)}, unique speakers: {len(calls_by_speaker)}")
+    banner(
+        NAME,
+        f"calls in manifest: {len(unique_rows)}"
+        + (f" across {len(all_rows)} rows" if len(all_rows) != len(unique_rows) else "")
+        + f", unique speakers: {len(calls_by_speaker)}",
+    )
     banner(NAME, f"worst mix residual: {worst_residual:.2e} (tolerance {MIX_TOLERANCE:.0e})")
     if not zerofy_mix:
         margin = "n/a" if worst_snr is None else f"{worst_snr:.1f} dB"

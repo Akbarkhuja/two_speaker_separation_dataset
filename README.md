@@ -102,7 +102,7 @@ Adding a backend? Register a stub in the test the way `StubVAD` / `StubEmbedder`
 ## The stages
 
 ```
-diarize -> filter -> vad -> embed -> cluster -> gender -> select -> enhance -> build
+diarize -> filter -> vad -> embed -> cluster -> gender -> select -> enhance -> augment -> build
 ```
 
 | stage | writes | what it does |
@@ -115,16 +115,41 @@ diarize -> filter -> vad -> embed -> cluster -> gender -> select -> enhance -> b
 | `gender` | `work/gender.json` | Male/female per global speaker, for balancing. |
 | `select` | `work/selection.json` | Per-speaker **speech-time** cap, gender balance, speaker-disjoint splits. |
 | `enhance` | `work/enhanced/<call>.flac` | Denoises both channels via the MossFormerGAN service, **before** they are summed. Optional but cached. |
-| `build` | `dataset/` | Mixture from the **original** channels; targets from the enhanced (or original) channels, zerofied. Shift and SIR are applied to both copies alike. Prunes call directories the selection dropped. |
+| `augment` | `work/augment/` | Prepares the degradation assets: simulated shoebox rooms, measured impulse responses, and the screened noise pool. Touches no call; runs in ~7 s and caches. |
+| `build` | `dataset/` | Mixture from the **original** channels; targets from the enhanced (or original) channels, zerofied. Shift and SIR are applied to both copies alike. Also writes the degraded mixtures. Prunes call directories the selection dropped. |
+
+### Augmentation
+
+`build` can write degraded copies of each mixture beside the clean one, following
+DialogueSidon (arXiv:2604.09344, Appendix A): reverberation, background noise, band
+limitation, clipping, a codec and packet loss, each firing at p = 0.5 **per track**.
+The two channels are degraded independently and only then summed — they are two
+telephone legs with their own line and handset, so one shared room and one shared
+codec would be the wrong task.
+
+`s1`/`s2` are never degraded and are shared by every variant: the training pair is
+(degraded mixture, clean targets). Four variants is the paper's number and turns
+~95 h of calls into ~475 h of pairs for ~22 GB. `build.augment.variants: 0` switches
+it off entirely.
+
+Two of the paper's seven steps are adapted, because this corpus is 8 kHz telephony
+and 99.9% of its energy is already below 3.8 kHz: its band limitation resamples only
+to rates at or above 8 kHz and would be an identity here, so a sub-Nyquist cutoff is
+drawn instead; and MP3 at 65–245 kbps measures 25 dB SNR on this audio, so the codec
+pool is G.711 µ-law/A-law, GSM 06.10 and low-bitrate Opus, which is what a call
+actually goes through. The paper's seventh step, the mixing weight `w ~ U(0.3,0.7)`,
+is `build.sir_db` under another name and is deliberately not applied twice.
 
 ### Output layout
 
 ```
 dataset/
   {train,dev,test}/<call>/{mix,s1,s2}.wav + meta.json
+  {train,dev,test}/<call>/mix_aug{0..N}.wav              # with build.augment.variants
   chunks/{train,dev,test}/{mix,s1,s2}/<call>_<idx>.wav   # with --chunks
+  chunks/{train,dev,test}/mix_aug{0..N}/<call>_<idx>.wav
 
-  manifest.jsonl                                          # every call
+  manifest.jsonl                                          # one row per (call, variant)
   train.jsonl  dev.jsonl  test.jsonl                      # the same rows, per split
   chunks/manifest.jsonl                                   # every chunk
   chunks/train.jsonl  chunks/dev.jsonl  chunks/test.jsonl
@@ -136,6 +161,11 @@ Point a trainer straight at a split — `dataset/chunks/train.jsonl`. Every conf
 split gets a file even when it holds nothing, so a path in a training command is
 never missing; `verify` checks the split files partition the combined manifest
 exactly, which is what catches one left stale by an earlier build.
+
+With augmentation on, a call contributes several rows that share a `call`, an `s1`
+and an `s2` and differ only in `mix`. The clean mixture carries `variant: null` and
+each degraded one its index, so a trainer can take the file whole or filter to
+either half. Anything counting calls or speakers has to fold on `call` first.
 
 8 kHz PCM_16, the source rate — nothing is resampled on the way out. The only
 resampling anywhere is the 16 kHz that TitaNet forces internally.

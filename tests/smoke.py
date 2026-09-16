@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import contextlib
+import dataclasses
 import io
 import json
 import random
@@ -46,12 +47,18 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from dsd import cli  # noqa: E402
+from dsd.augment import artifacts as aug_artifacts  # noqa: E402
+from dsd.augment import chain as aug_chain  # noqa: E402
+from dsd.augment import codec as aug_codec  # noqa: E402
+from dsd.augment import noise as aug_noise  # noqa: E402
+from dsd.augment import reverb as aug_reverb  # noqa: E402
 from dsd.config import Config  # noqa: E402
 from dsd.core import audio as A  # noqa: E402
 from dsd.core import rttm as R  # noqa: E402
 from dsd.core.manifest import read_json, read_jsonl  # noqa: E402
 from dsd.mixing import chunker, mixer, overlap  # noqa: E402
 from dsd.registry import EMBEDDERS, ENHANCERS, GENDER, VADS, Registry  # noqa: E402
+from dsd.stages import build as build_stage  # noqa: E402
 from dsd.stages import verify as verify_stage  # noqa: E402
 
 SR = 8000
@@ -1266,6 +1273,10 @@ build:
   chunk_sec: 4.0
   chunk_hop: 2.0
   min_active_per_src: 0.5
+  # Off for the main fixture: every check below is about the clean mixture, its
+  # targets and the manifest, and degrading them would only slow that down.
+  # `augmented_fixture` builds its own banks and turns this on.
+  augment: {variants: 0}
 """
 
 
@@ -2034,6 +2045,601 @@ def use_enhanced_always_refuses_a_missing_cache():
     finally:
         moved.rename(cached)
         fixture["run"]("build", "--overwrite", "--chunks")
+
+
+# --------------------------------------------------------------------------- #
+# [unit] DialogueSidon-style degradation
+# --------------------------------------------------------------------------- #
+def _aug_tone(seconds: float = 4.0, freqs=(300.0, 3000.0)) -> np.ndarray:
+    t = np.arange(int(SR * seconds)) / SR
+    return sum(0.3 / (i + 1) * np.sin(2 * np.pi * f * t) for i, f in enumerate(freqs)).astype(
+        np.float32
+    )
+
+
+def _band_energy(signal: np.ndarray, low: float, high: float) -> float:
+    spectrum = np.abs(np.fft.rfft(signal)) ** 2
+    freqs = np.fft.rfftfreq(len(signal), 1.0 / SR)
+    return float(spectrum[(freqs >= low) & (freqs < high)].sum())
+
+
+@check("unit")
+def band_limit_removes_only_above_the_cutoff():
+    x = _aug_tone()
+    y = aug_artifacts.band_limit(x, SR, 1500.0)
+
+    assert len(y) == len(x), f"length changed {len(x)} -> {len(y)}"
+    kept = _band_energy(y, 250, 350) / _band_energy(x, 250, 350)
+    cut = _band_energy(y, 2950, 3050) / _band_energy(x, 2950, 3050)
+    assert 0.95 < kept < 1.05, f"the 300 Hz tone should survive, kept {kept:.3f}"
+    assert cut < 1e-3, f"the 3 kHz tone should be gone, kept {cut:.2e}"
+
+    # A cutoff at or above Nyquist has nothing to remove and must be exact,
+    # since every rate the paper resamples to lands there on this corpus.
+    for cutoff in (SR / 2, SR, 48000.0):
+        assert np.array_equal(aug_artifacts.band_limit(x, SR, cutoff), x), cutoff
+    return f"300 Hz kept {kept:.3f}, 3 kHz cut to {cut:.1e}"
+
+
+@check("unit")
+def clipping_lands_on_the_requested_percentiles():
+    x = _aug_tone()
+    for low_pct, high_pct in ((0.0, 100.0), (5.0, 95.0), (10.0, 90.0)):
+        y = aug_artifacts.clip(x, low_pct, high_pct)
+        assert len(y) == len(x)
+        if (low_pct, high_pct) == (0.0, 100.0):
+            # The bottom of the draw must be the identity, or the step would
+            # always distort and `prob` would no longer control it.
+            assert np.array_equal(y, x), "0/100 percentiles must not change the signal"
+            continue
+        assert approx(y.min(), np.percentile(x, low_pct), tol=1e-5), y.min()
+        assert approx(y.max(), np.percentile(x, high_pct), tol=1e-5), y.max()
+        assert y.min() > x.min() and y.max() < x.max(), "nothing was actually clipped"
+    return "identity at 0/100, exact at 5/95 and 10/90"
+
+
+@check("unit")
+def packet_loss_zeroes_whole_segments_and_repeats():
+    x = _aug_tone(20.0) + 0.5  # offset, so a zero can only come from the dropper
+    frac, span = 0.09, (20.0, 200.0)
+    y, dropped = aug_artifacts.packet_loss(x, SR, random.Random(3), frac, span)
+
+    assert len(y) == len(x), f"length changed {len(x)} -> {len(y)}"
+    assert dropped > 0, "nothing was dropped"
+
+    # What must hold is that whole segments go, never fragments of one: no zero
+    # run may be shorter than the minimum segment. Runs can be *longer* than the
+    # maximum, because two segments that happen to be adjacent merge into one
+    # run -- so the count of runs is a lower bound on the count of drops, not an
+    # equality.
+    zero = y == 0.0
+    edges = np.diff(np.concatenate(([0], zero.view(np.int8), [0])))
+    starts, ends = np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)
+    lengths = (ends - starts) / SR * 1000.0
+    assert 0 < len(starts) <= dropped, f"{len(starts)} zero runs for {dropped} drops"
+    assert lengths.min() >= span[0] - 1.0, (
+        f"a {lengths.min():.1f} ms run is shorter than the {span[0]} ms minimum "
+        "segment -- part of a segment was dropped"
+    )
+
+    # Total zeroed time pins it down where the run count cannot: exactly
+    # `dropped` segments went, each between the two bounds.
+    total = float(lengths.sum())
+    assert dropped * span[0] * 0.99 <= total <= dropped * span[1] * 1.01, (
+        f"{total:.0f} ms zeroed for {dropped} segments of {span[0]}-{span[1]} ms"
+    )
+
+    share = float(zero.mean())
+    assert 0.02 < share < 0.20, f"{share:.3f} of samples zeroed, expected near {frac}"
+
+    # Same seed, same result: a recipe records only the seed, so reproducing a
+    # variant depends on this.
+    a, _ = aug_artifacts.packet_loss(x, SR, random.Random(11), frac, span)
+    b, _ = aug_artifacts.packet_loss(x, SR, random.Random(11), frac, span)
+    assert np.array_equal(a, b), "the same seed produced two different results"
+    assert frac == 0.0 or not np.array_equal(a, y), "different seeds gave the same result"
+    return f"{dropped} segments, {share:.3f} of samples, runs {lengths.min():.0f}-{lengths.max():.0f} ms"
+
+
+@check("unit")
+def every_codec_round_trip_preserves_length_and_alignment():
+    x = _aug_tone(6.0)
+    available = aug_codec.available()
+    assert "mulaw" in available, f"ffmpeg has no G.711 encoder; found {available}"
+
+    results = []
+    for kind, kbps in (("mulaw", None), ("alaw", None), ("gsm", None),
+                       ("opus", 24), ("mp3", 128)):
+        if kind not in available:
+            continue
+        y = aug_codec.round_trip(x, SR, kind, kbps)
+        assert len(y) == len(x), f"{kind}: length {len(x)} -> {len(y)}"
+        assert np.all(np.isfinite(y)), f"{kind}: non-finite samples"
+
+        # Alignment, not just length. MP3 through a raw pipe arrives 1105
+        # samples late and nothing else here would notice: the file would be the
+        # right size, the right loudness, and 138 ms out of step with s1/s2.
+        # Correlation against the input is what catches that.
+        aligned = abs(float(x @ y) / (np.linalg.norm(x) * np.linalg.norm(y) + 1e-12))
+        assert aligned > 0.7, (
+            f"{kind}: decoded signal correlates with the input at only {aligned:.3f} "
+            "-- it is delayed or otherwise misaligned"
+        )
+        results.append(f"{kind}={aligned:.2f}")
+    return "alignment " + " ".join(results)
+
+
+@check("unit")
+def reverb_preserves_length_and_dry_level():
+    x = _aug_tone(4.0)
+    ir = _decaying_ir(random.Random(5))
+
+    y = aug_reverb.apply(x, ir)
+    assert len(y) == len(x), f"length changed {len(x)} -> {len(y)}"
+
+    dry = float(np.sqrt(np.mean(x**2)))
+    wet = float(np.sqrt(np.mean(y**2)))
+    # The SIR build recorded in meta.json describes the signal before the chain
+    # runs. If reverb changed the level, that number would describe nothing.
+    assert approx(wet, dry, tol=0.01 * dry), f"dry {dry:.5f} -> wet {wet:.5f}"
+    assert not np.allclose(y, x, atol=1e-4), "the impulse response did nothing"
+
+    # Peak-aligned impulse responses are what let the convolution be truncated
+    # back to length without sliding the signal against its labels.
+    aligned = abs(float(x @ y) / (np.linalg.norm(x) * np.linalg.norm(y) + 1e-12))
+    assert aligned > 0.5, f"reverb moved the signal in time (corr {aligned:.3f})"
+    return f"rms {dry:.5f} -> {wet:.5f}, alignment {aligned:.3f}"
+
+
+@check("unit")
+def noise_lands_on_the_requested_snr():
+    x = _aug_tone(4.0)
+    mask = np.ones(len(x), dtype=bool)
+    bed = np.random.default_rng(0).standard_normal(len(x)).astype(np.float32)
+
+    for want in (-5.0, 0.0, 10.0, 20.0):
+        y = aug_noise.add_noise(x, bed, mask, want)
+        assert len(y) == len(x)
+        got = 20.0 * np.log10(
+            np.sqrt(np.mean(x.astype(np.float64) ** 2))
+            / np.sqrt(np.mean((y - x).astype(np.float64) ** 2))
+        )
+        assert approx(got, want, tol=0.5), f"asked {want} dB, measured {got:.2f} dB"
+
+    # Measured over speech, not over the whole signal: a telephone leg is mostly
+    # silence, and a whole-signal RMS would under-add noise by however much of it
+    # there happens to be.
+    half = np.zeros(len(x), dtype=bool)
+    half[: len(x) // 4] = True
+    quiet_side = x.copy()
+    quiet_side[len(x) // 4 :] = 0.0
+    y = aug_noise.add_noise(quiet_side, bed, half, 10.0)
+    speech = np.sqrt(np.mean(quiet_side[half].astype(np.float64) ** 2))
+    got = 20.0 * np.log10(speech / np.sqrt(np.mean((y - quiet_side).astype(np.float64) ** 2)))
+    assert approx(got, 10.0, tol=0.5), f"over a masked signal: asked 10 dB, got {got:.2f}"
+    return "within 0.5 dB at -5, 0, 10, 20 dB and over a mask"
+
+
+@check("unit")
+def a_recipe_is_reproducible_and_prob_controls_it():
+    cfg = Config()
+    banks = _stub_banks()
+
+    first = aug_chain.sample(random.Random("seed-a"), cfg.build.augment, banks)
+    again = aug_chain.sample(random.Random("seed-a"), cfg.build.augment, banks)
+    other = aug_chain.sample(random.Random("seed-b"), cfg.build.augment, banks)
+    assert first.to_dict() == again.to_dict(), "the same seed drew two different recipes"
+    assert first.to_dict() != other.to_dict(), "two seeds drew the same recipe"
+
+    none_cfg = dataclasses.replace(cfg.build.augment, prob=0.0)
+    empty = aug_chain.sample(random.Random("x"), none_cfg, banks)
+    assert not empty.any_applied(), f"prob=0 still drew {empty.to_dict()}"
+    x = _aug_tone(2.0)
+    assert np.array_equal(aug_chain.apply(x, empty, SR, banks), x), "an empty recipe changed the signal"
+
+    all_cfg = dataclasses.replace(cfg.build.augment, prob=1.0)
+    full = aug_chain.sample(random.Random("x"), all_cfg, banks)
+    missing = [s for s in aug_chain.STEPS if getattr(full, s) is None]
+    assert not missing, f"prob=1 did not draw {missing}"
+
+    # Applying the same recipe twice must give the same samples, or a variant
+    # could not be reproduced from what meta.json records.
+    once = aug_chain.apply(x, full, SR, banks)
+    twice = aug_chain.apply(x, full, SR, banks)
+    assert np.array_equal(once, twice), "applying one recipe twice gave two answers"
+    assert len(once) == len(x), f"the chain changed the length {len(x)} -> {len(once)}"
+    return f"{len(aug_chain.STEPS)} steps, all fired at prob=1, none at prob=0"
+
+
+@check("unit")
+def degradation_is_per_channel_and_happens_before_the_sum():
+    """The load-bearing property: each track is degraded on its own.
+
+    Degrading the finished mixture instead would give both speakers one shared
+    room, one shared noise recording and one shared codec -- a different and much
+    weaker task. This reconstructs the mixture from the two recorded recipes and
+    requires an exact match, which can only hold if the sum came last.
+    """
+    cfg = Config()
+    cfg.build.augment = dataclasses.replace(cfg.build.augment, prob=1.0)
+    banks = _stub_banks()
+
+    ch1 = _aug_tone(4.0, (300.0, 900.0))
+    ch2 = _aug_tone(4.0, (600.0, 2400.0))
+    mask = np.ones(len(ch1), dtype=bool)
+
+    mixture, recipes, gain = build_stage._degrade_variant(
+        ch1, ch2, mask, mask, cfg, banks, random.Random("v0")
+    )
+    assert len(recipes) == 2, recipes
+    assert len(mixture) == len(ch1)
+
+    rebuilt = gain * (
+        aug_chain.apply(ch1, aug_chain.Recipe.from_dict(recipes[0]), SR, banks, mask)
+        + aug_chain.apply(ch2, aug_chain.Recipe.from_dict(recipes[1]), SR, banks, mask)
+    )
+    assert np.allclose(mixture, rebuilt, atol=1e-6), (
+        "the mixture is not the sum of the two separately degraded channels; "
+        f"max difference {np.abs(mixture - rebuilt).max():.3e}"
+    )
+
+    # The two tracks must have drawn independently. Identical recipes on both
+    # sides is what applying one chain to the summed mixture would look like.
+    assert recipes[0] != recipes[1], "both channels drew the same recipe"
+
+    # And the same recipe applied to the sum is a different signal, so the two
+    # orderings are genuinely distinguishable by this test.
+    summed = aug_chain.apply(
+        ch1 + ch2, aug_chain.Recipe.from_dict(recipes[0]), SR, banks, mask
+    )
+    assert not np.allclose(mixture, summed, atol=1e-3), (
+        "degrading the sum gives the same answer as degrading the channels, so "
+        "this check cannot tell the two apart"
+    )
+    return f"exact to {np.abs(mixture - rebuilt).max():.1e}, peak gain {gain:.3f}"
+
+
+# --------------------------------------------------------------------------- #
+# [e2e] the augmented dataset
+# --------------------------------------------------------------------------- #
+_AUG_FIXTURE: dict | None = None
+
+# Everything fires, so the assertions below do not depend on a coin flip. The
+# ranges are narrowed only to keep the check fast, not to change what is tested.
+AUG_BUILD = """  augment:
+    variants: 2
+    prob: 1.0
+    reverb: {simulated_frac: 0.5}
+    noise: {snr_db: [5.0, 15.0]}
+    band_limit: {cutoff_hz: [2500.0, 3000.0]}
+    clip: {low_pct: [2.0, 5.0], high_pct: [95.0, 98.0]}
+    codec: {kinds: [mulaw, gsm], opus_kbps: [6, 24], mp3_kbps: [65, 245]}
+    packet_loss: {frac: 0.09, segment_ms: [20.0, 200.0]}
+"""
+
+
+def _decaying_ir(rng: random.Random, seconds: float = 0.3, rt60: float = 0.25) -> np.ndarray:
+    """Exponentially decaying noise: a plausible impulse response, peak at 0."""
+    n = int(seconds * SR)
+    gen = np.random.default_rng(rng.randrange(2**32))
+    tail = gen.standard_normal(n) * np.exp(-6.9 * np.arange(n) / (rt60 * SR))
+    ir = tail.astype(np.float32)
+    ir[0] = 1.0
+    return aug_reverb.align(ir, SR, seconds)
+
+
+def _stub_banks() -> "aug_chain.Banks":
+    """Banks backed by a handful of generated assets, written once to a temp dir."""
+    global _STUB_BANKS
+    if _STUB_BANKS is not None:
+        return _STUB_BANKS
+
+    root = Path(tempfile.mkdtemp(prefix="dsd_aug_assets_"))
+    atexit.register(shutil.rmtree, root, True)
+    (root / "irs").mkdir()
+    (root / "rirs").mkdir()
+    rng = random.Random(0)
+    for index in range(3):
+        A.write_wav(root / "irs" / f"ir{index}.wav", _decaying_ir(rng), SR, subtype="FLOAT")
+        A.write_wav(root / "rirs" / f"rir{index}.wav", _decaying_ir(rng), SR, subtype="FLOAT")
+
+    noise_dir = root / "noise"
+    noise_dir.mkdir()
+    gen = np.random.default_rng(5)
+    files = []
+    for index in range(4):
+        clip = (0.05 * gen.standard_normal(SR * 3)).astype(np.float32)
+        path = noise_dir / f"noise{index}.wav"
+        A.write_wav(path, clip, SR)
+        files.append(str(path))
+
+    _STUB_BANKS = aug_chain.Banks(
+        rirs=aug_reverb.RIRBank(root / "rirs", root / "irs", SR),
+        noise=aug_noise.NoiseBank(files, SR),
+        codecs=[k for k in ("mulaw", "gsm") if k in aug_codec.available()],
+    )
+    return _STUB_BANKS
+
+
+_STUB_BANKS: "aug_chain.Banks | None" = None
+
+
+def augmented_fixture() -> dict:
+    """Build the same calls twice -- clean and augmented -- from one config.
+
+    Two builds rather than a comparison against the shared e2e dataset: that one
+    is rebuilt by several checks above with different settings, so what is in it
+    depends on the order they ran in.
+    """
+    global _AUG_FIXTURE
+    if _AUG_FIXTURE is not None:
+        return _AUG_FIXTURE
+
+    base = e2e_fixture()
+    root = base["root"]
+    assets = Path(tempfile.mkdtemp(prefix="dsd_aug_src_"))
+    atexit.register(shutil.rmtree, assets, True)
+
+    # Impulse responses and noise on disk for the stage to ingest, so the
+    # fixture exercises the real `augment` stage rather than a hand-built bank.
+    (assets / "irs").mkdir()
+    (assets / "noise").mkdir()
+    rng = random.Random(1)
+    for index in range(3):
+        A.write_wav(assets / "irs" / f"ir{index}.wav", _decaying_ir(rng), SR, subtype="FLOAT")
+    gen = np.random.default_rng(2)
+    for index in range(4):
+        clip = (0.05 * gen.standard_normal(SR * 3)).astype(np.float32)
+        A.write_wav(assets / "noise" / f"noise{index}.wav", clip, SR)
+
+    config = root / "configs" / "aug.yaml"
+    body = E2E_CONFIG.replace("  augment: {variants: 0}\n", AUG_BUILD)
+    body += (
+        "augment:\n"
+        f"  ir_dir: {assets / 'irs'}\n"
+        f"  noise_dir: {assets / 'noise'}\n"
+        "  noise_screen_json: null\n"
+        "  simulated_rirs: 4\n"
+        "  rt60: [0.2, 0.5]\n"
+        "  room_dim: [3.0, 8.0]\n"
+        "  ir_max_sec: 0.5\n"
+    )
+    config.write_text(body, encoding="utf-8")
+
+    def run(*args: str) -> str:
+        with quiet() as buffer:
+            code = cli.main(["--config", str(config), *args])
+        output = buffer.getvalue()
+        if code != 0:
+            raise AssertionError(f"`dsd {' '.join(args)}` exited {code}\n{output}")
+        return output
+
+    logs = {"augment": run("augment", "--no-screen")}
+    logs["clean"] = run(
+        "--set", f"paths.dataset_dir={root / 'dataset_clean'}",
+        "--set", "build.augment.variants=0",
+        "build", "--chunks",
+    )
+    logs["build"] = run("--set", f"paths.dataset_dir={root / 'dataset_aug'}", "build", "--chunks")
+    logs["verify"] = run("--set", f"paths.dataset_dir={root / 'dataset_aug'}", "verify")
+
+    _AUG_FIXTURE = {
+        "root": root,
+        "config": config,
+        "run": run,
+        "logs": logs,
+        "clean": root / "dataset_clean",
+        "aug": root / "dataset_aug",
+    }
+    return _AUG_FIXTURE
+
+
+@check("e2e")
+def augmentation_adds_mixtures_and_leaves_the_targets_alone():
+    fixture = augmented_fixture()
+    clean_rows = list(read_jsonl(fixture["clean"] / "manifest.jsonl"))
+    rows = list(read_jsonl(fixture["aug"] / "manifest.jsonl"))
+
+    calls = {row["call"] for row in rows}
+    assert calls == {row["call"] for row in clean_rows}, "augmentation changed which calls exist"
+    assert len(rows) == 3 * len(calls), f"{len(rows)} rows for {len(calls)} calls, expected 3 each"
+
+    by_call: dict[str, list] = {}
+    for row in rows:
+        by_call.setdefault(row["call"], []).append(row)
+    for call, group in by_call.items():
+        variants = {r["variant"] for r in group}
+        assert variants == {None, 0, 1}, f"{call}: {variants}"
+        assert len({r["s1"] for r in group}) == 1, f"{call}: variants point at different s1"
+        assert len({r["mix"] for r in group}) == 3, f"{call}: variants share a mixture"
+
+    # The whole point of the pair: only the model's input is degraded. The
+    # targets, and the clean mixture, must be byte-identical to a build with
+    # augmentation switched off.
+    for row in clean_rows:
+        for name in ("mix", "s1", "s2"):
+            a = (fixture["clean"] / row[name]).read_bytes()
+            b = (fixture["aug"] / row[name]).read_bytes()
+            assert a == b, f"{row['call']}: {name}.wav differs between the two builds"
+    return f"{len(calls)} calls -> {len(rows)} rows, targets bit-identical"
+
+
+@check("e2e")
+def degraded_mixtures_differ_from_the_clean_one_and_from_each_other():
+    fixture = augmented_fixture()
+    rows = list(read_jsonl(fixture["aug"] / "manifest.jsonl"))
+
+    by_call: dict[str, dict] = {}
+    for row in rows:
+        by_call.setdefault(row["call"], {})[row["variant"]] = row
+
+    correlations = []
+    for call, group in by_call.items():
+        clean, _ = A.read_audio(fixture["aug"] / group[None]["mix"])
+        signals = []
+        for index in (0, 1):
+            data, _ = A.read_audio(fixture["aug"] / group[index]["mix"])
+            assert len(data) == len(clean), f"{call}: variant {index} has a different length"
+            signals.append(data[:, 0])
+            assert not np.array_equal(data[:, 0], clean[:, 0]), (
+                f"{call}: variant {index} is identical to the clean mixture"
+            )
+            correlations.append(
+                abs(float(clean[:, 0] @ data[:, 0])
+                    / (np.linalg.norm(clean[:, 0]) * np.linalg.norm(data[:, 0]) + 1e-12))
+            )
+        assert not np.array_equal(signals[0], signals[1]), f"{call}: the two variants are identical"
+
+        # Every step fired (prob 1.0), so every variant records both tracks.
+        meta = read_json(fixture["aug"] / group[None]["split"] / call / "meta.json")
+        items = meta["augment"]["items"]
+        assert len(items) == 2, items
+        for item in items:
+            assert len(item["recipes"]) == 2, "a variant must record one recipe per channel"
+            for recipe in item["recipes"]:
+                missing = [s for s in aug_chain.STEPS if s not in recipe]
+                assert not missing, f"{call}: prob=1 but {missing} did not fire"
+    return (
+        f"{len(correlations)} variants, correlation with the clean mixture "
+        f"{min(correlations):.2f}..{max(correlations):.2f}"
+    )
+
+
+@check("e2e")
+def verify_catches_a_corrupted_variant():
+    fixture = augmented_fixture()
+    rows = list(read_jsonl(fixture["aug"] / "manifest.jsonl"))
+    target = next(r for r in rows if r["variant"] == 0)
+    path = fixture["aug"] / target["mix"]
+    original = path.read_bytes()
+
+    def verify_fails(what: str) -> str:
+        """Run verify, require it to fail, and hand back what it printed.
+
+        `verify` reports problems by raising SystemExit(1), whose str() is just
+        "1", so the output has to be captured here rather than read off the
+        exception -- and the output is the point: this check is about *which*
+        test fired, not merely that something did.
+        """
+        with quiet() as buffer:
+            try:
+                code = cli.main(
+                    ["--config", str(fixture["config"]),
+                     "--set", f"paths.dataset_dir={fixture['aug']}", "verify"]
+                )
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else 1
+        output = buffer.getvalue()
+        assert code != 0, f"verify passed a variant that was {what}\n{output}"
+        return output
+
+    try:
+        data, sr = A.read_audio(path)
+        # A time shift leaves the RMS untouched, so only the correlation the
+        # build recorded can see it. This is the case the fingerprint misses.
+        A.write_wav(path, np.roll(data[:, 0], 500), sr)
+        shifted = verify_fails("time-shifted")
+        assert "correlates with mix.wav" in shifted, shifted
+
+        # A rescale moves the level, which the fingerprint catches.
+        A.write_wav(path, data[:, 0] * 0.9, sr)
+        rescaled = verify_fails("rescaled")
+        assert "rms" in rescaled, rescaled
+    finally:
+        path.write_bytes(original)
+
+    fixture["run"]("--set", f"paths.dataset_dir={fixture['aug']}", "verify")
+    return "shift and rescale both caught, clean dataset still passes"
+
+
+@check("e2e")
+def augmented_chunks_share_one_set_of_targets():
+    fixture = augmented_fixture()
+    rows = list(read_jsonl(fixture["aug"] / "chunks" / "manifest.jsonl"))
+    assert rows, "no chunks were written"
+
+    by_offset: dict[tuple, list] = {}
+    for row in rows:
+        by_offset.setdefault((row["call"], row["offset"]), []).append(row)
+
+    for key, group in by_offset.items():
+        assert len(group) == 3, f"{key}: {len(group)} rows, expected clean + 2 variants"
+        assert len({r["s1"] for r in group}) == 1, f"{key}: chunk targets are not shared"
+        assert len({r["mix"] for r in group}) == 3, f"{key}: chunk mixtures are not distinct"
+        for row in group:
+            assert (fixture["aug"] / row["mix"]).exists(), row["mix"]
+
+    clean_chunks = list(read_jsonl(fixture["clean"] / "chunks" / "manifest.jsonl"))
+    assert len(rows) == 3 * len(clean_chunks), (
+        f"{len(rows)} augmented chunks for {len(clean_chunks)} clean ones"
+    )
+    return f"{len(by_offset)} windows x 3, {len(rows)} chunk rows"
+
+
+@check("e2e")
+def changing_the_variant_count_invalidates_the_cache():
+    fixture = augmented_fixture()
+    scratch = fixture["root"] / "dataset_variants"
+
+    first = fixture["run"]("--set", f"paths.dataset_dir={scratch}", "build")
+    assert "wrote 8 calls as 24 rows" in first, first
+
+    # Same settings: nothing should be rebuilt, and the manifest must survive.
+    again = fixture["run"]("--set", f"paths.dataset_dir={scratch}", "build")
+    assert len(list(read_jsonl(scratch / "manifest.jsonl"))) == 24, again
+
+    # One more variant is a different dataset, so every call has to be redone.
+    grown = fixture["run"](
+        "--set", f"paths.dataset_dir={scratch}", "build", "--variants", "3"
+    )
+    rows = list(read_jsonl(scratch / "manifest.jsonl"))
+    assert len(rows) == 32, f"{len(rows)} rows after --variants 3\n{grown}"
+    assert sorted({r["variant"] for r in rows}, key=lambda v: (v is not None, v)) == [
+        None, 0, 1, 2
+    ], sorted({r["variant"] for r in rows}, key=str)
+
+    # And back down: the third variant's rows must go, not linger in the manifest.
+    shrunk = fixture["run"](
+        "--set", f"paths.dataset_dir={scratch}", "build", "--variants", "0"
+    )
+    rows = list(read_jsonl(scratch / "manifest.jsonl"))
+    assert len(rows) == 8, f"{len(rows)} rows after --variants 0\n{shrunk}"
+    assert {r["variant"] for r in rows} == {None}, {r["variant"] for r in rows}
+
+    # The files have to go too. The call directory survives -- the selection
+    # still holds the call -- so nothing else would ever remove them, and a
+    # trainer globbing the tree would pick up mixtures this dataset disowned.
+    left = sorted(p.name for p in scratch.glob("*/*/mix_aug*.wav"))
+    assert not left, f"{len(left)} degraded mixtures left on disk (e.g. {left[0]})"
+    fixture["run"]("--set", f"paths.dataset_dir={scratch}", "verify")
+    return "24 -> 24 cached -> 32 -> 8, stale variants deleted"
+
+
+@check("e2e")
+def speaker_caps_are_counted_per_call_not_per_row():
+    """The bug the extra rows would otherwise introduce.
+
+    `verify` counts a speaker's calls and speech from the manifest. With three
+    rows per call those totals triple, and a selection that is exactly at its cap
+    gets reported as three times over it -- a failure on a correct dataset.
+    """
+    fixture = augmented_fixture()
+    rows = list(read_jsonl(fixture["aug"] / "manifest.jsonl"))
+
+    per_row: dict[str, int] = {}
+    for row in rows:
+        for speaker in row["speakers"]:
+            per_row[speaker] = per_row.get(speaker, 0) + 1
+    cap = read_json(fixture["root"] / "work" / "selection.json")["max_calls_per_speaker"]
+    assert cap, "the fixture selection has no call cap, so this proves nothing"
+    assert max(per_row.values()) > cap, (
+        "counting rows should have exceeded the cap, or this check is vacuous"
+    )
+
+    # verify is what has to disagree with the naive count.
+    output = fixture["run"]("--set", f"paths.dataset_dir={fixture['aug']}", "verify")
+    assert "exceed" not in output, output
+    return f"rows would say {max(per_row.values())} calls for a cap of {cap}; verify passes"
 
 
 # --------------------------------------------------------------------------- #

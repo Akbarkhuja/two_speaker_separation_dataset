@@ -99,14 +99,14 @@ python -m dsd build --set build.chunks=true      # WRONG - argparse error
 | `--root PATH` | project root; defaults to the config file's grandparent |
 | `--set KEY=VALUE` | override any config key, repeatable. Values are parsed as YAML, so `true` is a bool and `[-2,2]` is a list |
 
-Subcommands: the nine stages, plus `verify`, `run`, `backends`, `config`.
+Subcommands: the ten stages, plus `verify`, `run`, `backends`, `config`.
 
 ---
 
 ## 3. The stages
 
 ```
-diarize → filter → vad → embed → cluster → gender → select → enhance → build     (then verify)
+diarize → filter → vad → embed → cluster → gender → select → enhance → augment → build   (then verify)
 ```
 
 | # | stage | reads | writes |
@@ -119,7 +119,8 @@ diarize → filter → vad → embed → cluster → gender → select → enhan
 | 6 | `gender` | `work/suitable.json`, `work/vad/`, `work/speakers.json` | `work/gender.json` |
 | 7 | `select` | `work/suitable.json`, `work/vad/`, `work/speakers.json`, `work/gender.json`\* | `work/selection.json` |
 | 8 | `enhance` | `work/selection.json`, `work/vad/`, audio | `work/enhanced/<call>.flac` |
-| 9 | `build` | `work/selection.json`, `work/vad/`, original audio (mixture) + enhanced or original audio (targets) | `dataset/**`, `manifest.jsonl` + `<split>.jsonl`, `stats.json` |
+| 9 | `augment` | the impulse-response and noise corpora named in `augment.*` | `work/augment/{irs,rirs}/`, `noise.json`, `index.json` |
+| 10 | `build` | `work/selection.json`, `work/vad/`, original audio (mixture) + enhanced or original audio (targets), `work/augment/` | `dataset/**`, `manifest.jsonl` + `<split>.jsonl`, `stats.json` |
 | — | `verify` | `dataset/manifest.jsonl` | nothing; exit code only |
 
 \* optional — see §5.
@@ -136,7 +137,7 @@ continues; one unreadable call out of 5613 must not cost the other 5612.
 python -m dsd run
 
 # a cheap end-to-end trial first (recommended before committing to a full run)
-python -m dsd run --stages diarize,filter,vad,embed,cluster,select,build --limit 30 --chunks
+python -m dsd run --stages diarize,filter,vad,embed,cluster,select,augment,build --limit 30 --chunks
 python -m dsd verify
 ```
 
@@ -248,7 +249,7 @@ starting over. To force work, pass `--overwrite` to that stage.
 
 ### Which stages are genuinely optional
 
-**`gender` and `enhance` are the optional stages.** Without `work/gender.json`, `select`
+**`gender`, `enhance` and `augment` are the optional stages.** Without `work/gender.json`, `select`
 prints a warning and carries on with gender balancing disabled:
 
 ```
@@ -259,10 +260,21 @@ prints a warning and carries on with gender balancing disabled:
 missing cache just means the dataset is built from raw audio. Set it to `always` if you
 want `build` to refuse rather than quietly mix enhanced and raw calls in one dataset.
 
+`augment` is optional too, but differently: it needs no service, only the impulse-response
+and noise corpora that `augment.ir_dir` / `augment.noise_dir` point at. If you do not have
+them, turn the degradation off rather than skipping the stage —
+
+```bash
+python -m dsd --set build.augment.variants=0 build --chunks
+```
+
+— because `build` refuses to start when it is asked for variants it has no assets for,
+rather than quietly writing a dataset with no degradation in it.
+
 That is the right way to run when the Docker services are not up:
 
 ```bash
-python -m dsd run --stages diarize,filter,vad,embed,cluster,select,build --chunks
+python -m dsd run --stages diarize,filter,vad,embed,cluster,select,augment,build --chunks
 ```
 
 Everything else is load-bearing. In particular **`vad` cannot be skipped** — its
@@ -298,6 +310,8 @@ too. Read a row as "run these, in this order":
 | the gender service or its options | `gender --overwrite`, `select --overwrite`, `build --overwrite` |
 | `select.*` caps or splits | `select --overwrite`, `build --overwrite` |
 | `enhance.*`, or the enhancement service | `enhance --overwrite`, `build --overwrite` |
+| `augment.*` corpora or room settings | `augment --overwrite`, `build --overwrite` |
+| `build.augment.*` (incl. `variants`) | `build` — it notices the change itself and rebuilds what it must |
 | `build.*` mixing parameters (incl. `seam_guard_ms`) | `build --overwrite` |
 
 Avoid `run --overwrite` unless you mean it: it propagates to *every* stage that
@@ -325,7 +339,7 @@ python -m dsd select --overwrite --max-duration-per-speaker 0 --max-calls-per-sp
 python -m dsd build --overwrite --chunks
 
 # Everything except gender, because the Docker service is not running
-python -m dsd run --stages diarize,filter,vad,embed,cluster,select,build --chunks
+python -m dsd run --stages diarize,filter,vad,embed,cluster,select,augment,build --chunks
 
 # Resume a full run that was interrupted: identical command, finished work is skipped
 python -m dsd run --chunks
@@ -349,7 +363,8 @@ get its own options.
 | `gender` | ✓ | ✓ | – | `--backend` `--base-url` `--workers` |
 | `select` | – | ✓ | – | `--max-duration-per-speaker SECONDS` `--max-calls-per-speaker` `--no-balance-gender` |
 | `enhance` | ✓ | ✓ | – | `--backend` `--base-url` `--regions {speech,full}` `--workers` |
-| `build` | ✓ | ✓ | ✓ | `--shuffle` / `--no-shuffle` `--no-prune` |
+| `augment` | – | ✓ | – | `--simulated N` `--no-screen` |
+| `build` | ✓ | ✓ | ✓ | `--shuffle` / `--no-shuffle` `--variants N` `--no-prune` |
 | `verify` | ✓ | – | – | `--sample N` |
 
 > `--limit N` is applied by each stage **independently**, to its own input. With

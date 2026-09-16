@@ -19,8 +19,18 @@ silero-vad==6.2.1        # vad stage
 librosa==0.11.0          # core.audio.resample -- 8 kHz -> 16 kHz for titanet
 requests==2.34.2         # moss_http diarizer, http_ecapa gender client
 urllib3==2.7.0           # the pooled-session Retry policy for both clients
+scipy==1.18.0            # augment: the band-limit filter and the reverb convolution
+pyroomacoustics==0.10.1  # augment stage only, and only for simulated rooms. Without
+                         # it the stage says so and the reverb bank falls back to the
+                         # measured impulse responses.
 
-# Not a Python dependency, but the two HTTP backends need a service running:
+# Not a Python dependency. `augment` shells out to ffmpeg for the codec step and
+# needs encoders for the codecs named in build.augment.codec.kinds -- pcm_mulaw
+# and pcm_alaw are built in, gsm needs --enable-libgsm, opus --enable-libopus.
+# Codecs ffmpeg cannot encode are dropped with a warning, not an error.
+#   ffmpeg -encoders | grep -E 'pcm_mulaw|pcm_alaw|libgsm|libopus'
+#
+# The two HTTP backends need a service running:
 #   gender   docker run --name gender-detection-api \
 #              -e BIND=0.0.0.0:8001 -p 8001:8001 \
 #              akbarumirzokov/gender-detection:latest
