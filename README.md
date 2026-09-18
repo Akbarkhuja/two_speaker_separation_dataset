@@ -4,10 +4,11 @@ Turns dual-channel telephony recordings into a 2-speaker separation dataset:
 one mixture plus two ground-truth source signals per call. **The mixture is always
 the two original `.opus` channels summed**, so it keeps the noise floor, the room
 and the telephone line exactly as recorded. The two targets are each speaker's own
-channel — denoised, when the `enhance` stage has run — with everything outside
-their speech faded out. The model's input is a real call; its outputs are clean
-speech. `build.zerofy_mix=true` gives the strict `mix == s1 + s2` dataset instead,
-the one mode where the mixture is built from the targets.
+channel — restored by Sidon to **24 kHz**, when the `enhance` stage has run — with
+everything outside their speech faded out. The model's input is a real 8 kHz call;
+its outputs are clean, wideband speech. `build.zerofy_mix=true` gives the strict
+`mix == s1 + s2` dataset instead, the one mode where the mixture is built from the
+targets — only with same-rate targets.
 
 The corpus works for this because **the two parties sit on physically isolated
 channels**. Measured across 158 calls, cross-channel `|corr|` is mean 0.0006 /
@@ -114,7 +115,7 @@ diarize -> filter -> vad -> embed -> cluster -> gender -> select -> enhance -> a
 | `cluster` | `work/speakers.json` | Global speaker identities via constrained complete-linkage AHC. |
 | `gender` | `work/gender.json` | Male/female per global speaker, for balancing. |
 | `select` | `work/selection.json` | Per-speaker **speech-time** cap, gender balance, speaker-disjoint splits. |
-| `enhance` | `work/enhanced/<call>.flac` | Denoises both channels via the MossFormerGAN service, **before** they are summed. Optional but cached. |
+| `enhance` | `work/enhanced/<call>.flac` + `cache.json` | Restores both channels via the Sidon service at 24 kHz, **before** they are summed. Optional but cached; the marker records the model and rates. |
 | `augment` | `work/augment/` | Prepares the degradation assets: simulated shoebox rooms, measured impulse responses, and the screened noise pool. Touches no call; runs in ~7 s and caches. |
 | `build` | `dataset/` | Mixture from the **original** channels; targets from the enhanced (or original) channels, zerofied. Shift and SIR are applied to both copies alike. Also writes the degraded mixtures. Prunes call directories the selection dropped. |
 
@@ -167,8 +168,12 @@ and an `s2` and differ only in `mix`. The clean mixture carries `variant: null` 
 each degraded one its index, so a trainer can take the file whole or filter to
 either half. Anything counting calls or speakers has to fold on `call` first.
 
-8 kHz PCM_16, the source rate — nothing is resampled on the way out. The only
-resampling anywhere is the 16 kHz that TitaNet forces internally.
+PCM_16 at **two rates**: `mix.wav` and every `mix_aug*.wav` at 8 kHz, the source
+rate; `s1.wav`/`s2.wav` at `enhance.output_sample_rate`, 24 kHz, over exactly the
+same duration (three target samples per mixture sample). Manifest rows keep
+`sample_rate` as the mixture's and add `target_sample_rate`; chunk rows likewise.
+With `build.use_enhanced=never` or `enhance.output_sample_rate: null`, all three
+are 8 kHz, as before.
 
 ---
 
@@ -288,14 +293,42 @@ the short gap that cutting it leaves behind.
 **Enhancement runs before the sum, and in its own stage.** Speech enhancement is
 non-linear, so `enhance(s1 + s2) != enhance(s1) + enhance(s2)` — it has to be applied to
 the two isolated channels and the mixture formed afterwards, or the sources stop being
-the mixture's speech content. It is a separate stage rather than part of `build` because throughput is fixed at
-**~3.2x realtime and does not improve with concurrency** (measured 3.17x / 3.28x / 3.27x at
-1 / 4 / 8 workers: one replica, adaptive batch cap 1), while `build` is the stage you re-run
-most. Only the VAD speech spans are sent — everything else is zerofied by `build` anyway —
-which takes the selected set from ~44 h to **~22 h**. The service returns 8 kHz when
-`output_sample_rate` is omitted, and length is preserved exactly, so every VAD offset stays
-valid; verified on real audio, the untouched 65% of a call differs by at most half a PCM_16
-LSB while speech differs by ~120.
+the mixture's speech content. It is a separate stage rather than part of `build` because it
+is GPU-bound and cached, while `build` is the stage you re-run most. Only the VAD speech
+spans are sent — everything else is zerofied by `build` anyway — which takes the selected
+set from ~44 h to **~22 h**. Measured against the Sidon service: ~25x realtime over 62
+spans.
+
+**The targets are 24 kHz and the mixture 8 kHz, on purpose.** The enhancer is Sidon, a
+*generative* restorer (w2v-BERT feature predictor + vocoder, decoder 8·5·4·3·2 = 960x at
+50 frames/s = 48 kHz): given 8 kHz telephone speech it reconstructs the band above 4 kHz
+rather than interpolating it. The consumer is DialogueSidon, whose frozen decoder emits
+24 kHz (480x at 50 frames/s) and whose pretraining targets were exactly this — Fisher and
+CALLHOME, 8 kHz telephone, restored by Sidon and downsampled 48 → 24 kHz. Narrowband input,
+wideband targets. 8 kHz targets would teach it that the right answer above 4 kHz is
+silence. The service answers at the *input* rate unless `output_sample_rate` is sent, which
+is how this pipeline used to discard the band on every request; the client now always
+sends it. Measured on two built calls: targets carry −24 to −27 dB of their energy above
+4 kHz, where the 8 kHz targets carried none, and `mix.wav` still carries none.
+
+The asymmetry is not a bug to reconcile. Do not upsample the mixture or downsample the
+targets. What makes it safe is that the rate ratio is an integer: every VAD interval is
+a time in seconds converted at each track's own rate, the overlap roll moves both copies
+by the same time (`shift × 3` samples at 24 kHz), and `build`/`verify` check the same
+*duration* to the sample instead of the same length. `build.zerofy_mix=true` is refused at
+mixed rates: its mixture is `s1 + s2`, which would make the model's input a downsample of
+Sidon's output rather than the recording.
+
+**The earlier cache was not Sidon.** Before this, the client posted to `/v1/enhance` — the
+MossFormerGAN / RE-USE contract, which the Sidon server does not serve — and the caches it
+left (`work/enhanced/`, `work/enhanced_mossformergan/`) correlate with the original
+recording at 0.997–0.999 inside speech, sample for sample. That is a masking model; Sidon's
+output correlates with its input at ~0.1. `http_mossformergan` survives only as an alias of
+the Sidon client. The cache marker (`cache.json`: backend, `/healthz` model, both rates, span
+settings) makes this detectable from now on: `enhance` refuses to extend a cache made
+differently or one with no marker, and `build` refuses a cache at the wrong rate, a
+half-migrated one, or `use_enhanced=auto` with calls missing when that would put 8 kHz raw
+targets next to 24 kHz ones.
 
 **`mix.wav` comes from the original audio, never the enhanced copy.** An earlier
 build read one file for both halves of the pair, so once `enhance` had run the
@@ -311,9 +344,12 @@ separately.
 This costs the exact sum: `mix - (s1 + s2)` holds the background *and* whatever the
 enhancer removed, which correlates with the voices (mean 0.42, max 0.69 over 12
 calls). So `verify` checks this mode differently — where one speaker talks alone,
-the mixture and that target must correlate above 0.8 (measured 0.993), and every
-file's RMS must match the fingerprint `build` recorded, which is what catches a
-rescaled or swapped mixture that correlation alone cannot see.
+the mixture and that target (brought to 8 kHz for the check only) must match as
+short-time *magnitude* spectra above 0.65, and every file's RMS must match the
+fingerprint `build` recorded, which is what catches a rescaled or swapped mixture
+that correlation alone cannot see. Magnitudes, not waveforms, because Sidon is not
+phase-locked to its input: correct files measure 0.82–0.89 (0.98+ for a masking
+enhancer), a target 50 ms out of step at most 0.47, another call's 0.10.
 
 **Speakers are capped by speech time, not call count.** What a model hears of a voice
 is seconds, and one side of one call carries anywhere from 5 s to ~14 min — so a call count
@@ -366,10 +402,15 @@ docker compose up -d moss-server           # vLLM, port 8000
 ```
 
 ```bash
-# enhance stage -- the MossFormerGAN service, port 8000
-cd /home/akbar/craft/prod/mossformergan_serve && docker compose up -d
-curl -s localhost:8000/healthz
+# enhance stage -- the Sidon service (sidon_serving), POST /v1/restore, port 8000
+cd /home/akbar/craft/prod && SIDON_DEVICES=cuda:0 \
+    /home/akbar/miniconda3/envs/nemo/bin/python -m uvicorn \
+    sidon_serving.server.app:app --host 0.0.0.0 --port 8000
+curl -s localhost:8000/healthz               # must say "model": "Sidon"
 ```
+
+(`sidon_serving/venv` was built against a Python 3.11 that is no longer installed; the
+`nemo` env has every dependency.)
 
 MOSS is 0.9 B and wants ~6 GB VRAM, so on a single 8 GB card it cannot share the
 GPU with the Sortformer or TitaNet stages. `sortformer` is the practical default.

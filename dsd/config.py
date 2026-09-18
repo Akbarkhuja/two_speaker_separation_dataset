@@ -36,6 +36,10 @@ class PathsConfig:
     pattern: str = "**/*.opus"
     work_dir: Path = Path("work")
     dataset_dir: Path = Path("dataset")
+    # The enhancement cache. null means `<work_dir>/enhanced`. Settable because
+    # a cache takes days to fill: moving to a new enhancer or output rate should
+    # be able to start a second cache beside the old one rather than on top of it.
+    enhanced_dir: Path | None = None
 
     def resolve(self) -> None:
         """Make every path absolute against `root`, once, at load time.
@@ -47,6 +51,11 @@ class PathsConfig:
         self.root = self.root.expanduser().resolve()
         self.work_dir = self._under_root(self.work_dir)
         self.dataset_dir = self._under_root(self.dataset_dir)
+        self.enhanced_dir = (
+            self.work_dir / "enhanced"
+            if self.enhanced_dir is None
+            else self._under_root(self.enhanced_dir)
+        )
         self.audio_dirs = [str(self._under_root(Path(d))) for d in self.audio_dirs]
 
     def _under_root(self, path: Path) -> Path:
@@ -89,10 +98,6 @@ class PathsConfig:
     @property
     def selection_json(self) -> Path:
         return self.work_dir / "selection.json"
-
-    @property
-    def enhanced_dir(self) -> Path:
-        return self.work_dir / "enhanced"
 
     @property
     def augment_dir(self) -> Path:
@@ -201,7 +206,13 @@ class SelectConfig:
 
 @dataclass
 class EnhanceConfig:
-    backend: str = "http_mossformergan"
+    backend: str = "http_sidon"
+    # Rate of the enhanced targets; null keeps the source rate. 24 kHz because
+    # it is the rate DialogueSidon's frozen decoder emits (480x at 50 frames/s),
+    # and Sidon synthesises at 48 kHz, so the 4-12 kHz band it restores is real
+    # content rather than interpolation. The mixture stays at `sample_rate`.
+    # Must be an integer multiple of `sample_rate`, so time offsets map exactly.
+    output_sample_rate: int | None = 24000
     # 'speech' enhances only the VAD spans; everything outside them is zerofied
     # by `build` regardless, so enhancing it is pure waste. 'full' does the
     # whole channel, which is what the model was trained on but ~1.7x the audio.

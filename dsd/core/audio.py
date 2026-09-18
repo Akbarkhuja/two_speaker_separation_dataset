@@ -1,8 +1,12 @@
 """Audio I/O and the sample-domain helpers every stage shares.
 
-All disk I/O goes through soundfile. Sources are 8 kHz 2-channel OGG/OPUS and
-stay at 8 kHz end to end -- the only resampling in the pipeline is the one
-TitaNet forces (see `dsd/backends/embedders/titanet.py`).
+All disk I/O goes through soundfile. Sources are 8 kHz 2-channel OGG/OPUS, and
+the mixture stays at 8 kHz end to end. The targets do not: they are cached and
+written at `enhance.output_sample_rate` (24 kHz), carrying the band Sidon
+restores. Other resampling: TitaNet's 16 kHz (see
+`dsd/backends/embedders/titanet.py`), the non-speech remainder of an enhanced
+channel carried to the output rate, and `verify` bringing targets down to the
+mixture's rate for its checks.
 """
 
 from __future__ import annotations

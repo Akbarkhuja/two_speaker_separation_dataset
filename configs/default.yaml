@@ -2,7 +2,10 @@
 #   python -m dsd --set build.chunks=true --set select.max_calls_per_speaker=2 run
 
 seed: 1234
-sample_rate: 8000            # the source rate; nothing is resampled on the way out
+# The source rate, and the rate of mix.wav and every mix_aug*.wav: the model's
+# input is the call as recorded. The targets s1/s2 follow
+# enhance.output_sample_rate instead (24 kHz) -- see there.
+sample_rate: 8000
 
 paths:
   root: .                    # everything below is resolved against this
@@ -10,6 +13,9 @@ paths:
   pattern: "**/*.opus"
   work_dir: work             # all intermediates land here
   dataset_dir: dataset
+  # The enhancement cache; null is work/enhanced. A cache made at another rate
+  # or by another model is refused, so a new one goes in a new directory.
+  enhanced_dir: null
 
 # --------------------------------------------------------------------------- #
 # 1. diarize -> work/rttms/
@@ -128,20 +134,40 @@ select:
 # break `mix == s1 + s2`. Its own stage because throughput is ~3.2x realtime and
 # does not improve with concurrency, while `build` gets re-run constantly.
 enhance:
-  backend: http_mossformergan
+  # Sidon: a generative restorer that synthesises at 48 kHz, reconstructing the
+  # band above 4 kHz that the telephone line never carried. `http_mossformergan`
+  # is an old name for the same client, kept so existing command lines work.
+  backend: http_sidon
+  # Rate of the enhanced targets (s1/s2); null keeps 8 kHz. 24 kHz is not a
+  # round number picked for quality: it is the rate DialogueSidon's decoder
+  # emits (480x upsampling at 50 frames/s), and that decoder is frozen during
+  # fine-tuning. Its pretraining targets were Sidon's 48 kHz output downsampled
+  # to 24 kHz, from 8 kHz telephone input -- narrowband in, wideband out. 8 kHz
+  # targets teach it that the right answer above 4 kHz is silence. Do not
+  # "simplify" this back to sample_rate. Must be a whole multiple of it.
+  # Changing it needs a fresh cache (paths.enhanced_dir) and build --overwrite.
+  output_sample_rate: 24000
   regions: speech            # speech | full -- non-speech is zerofied by build anyway
   merge_gap: 0.5             # join VAD spans closer than this into one request
   context_sec: 0.5           # run-in context per span, trimmed off before splicing
   min_span_sec: 0.3
-  format: flac               # cache container; lossless at PCM_16, ~half of WAV
+  format: flac               # cache container; lossless at PCM_16, ~half of WAV (~3x at 24 kHz)
   workers: 1
   options:
-    http_mossformergan:
-      # Where mossformergan_serve actually runs. Note this is also moss_http's
-      # default port, so the enhancer and the MOSS diarizer cannot both be up.
+    http_sidon:
+      # sidon_serving, POST /v1/restore. Port 8000 is also moss_http's default,
+      # so the restorer and the MOSS diarizer cannot both be up.
       base_url: http://localhost:8000
-      timeout: 600.0
+      timeout: 900.0
       retries: 3
+      # Sidon peak-normalises internally; `peak` puts each span's input peak
+      # back. Sent explicitly so the server's env default cannot change it.
+      level_match: peak
+    http_mossformergan:      # the same Sidon client under its old name
+      base_url: http://localhost:8000
+      timeout: 900.0
+      retries: 3
+      level_match: peak
 
 # --------------------------------------------------------------------------- #
 # 9. augment -> work/augment/

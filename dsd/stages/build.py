@@ -1,6 +1,8 @@
 """Stage 8 -- write the mixtures and their two ground-truth sources.
 
-Per selected call, at the source's native 8 kHz:
+Per selected call -- the mixture at the source's native 8 kHz, the targets at
+`enhance.output_sample_rate` (24 kHz: Sidon's restored band, the rate
+DialogueSidon's decoder emits) when they come from the enhanced cache:
 
     cut the excluded (possible third voice) spans from both channels
     optionally roll channel 2 to synthesize speech overlap
@@ -40,7 +42,7 @@ from pathlib import Path
 import numpy as np
 
 from ..augment import chain as augment_chain
-from ..core.audio import active_rms, demux, read_audio, speech_mask, write_wav
+from ..core.audio import active_rms, demux, probe, read_audio, resample, speech_mask, write_wav
 from ..core.manifest import read_json, write_failures, write_json, write_jsonl
 from ..core.rttm import read_rttm, subtract_intervals
 from ..mixing.chunker import is_usable, windows
@@ -49,7 +51,7 @@ from ..mixing.overlap import overlap_ratio, roll, shift_for_target
 from ..mixing.zerofy import apply_mask, mute
 from .augment import load_banks
 from .base import banner, progress, require
-from .enhance import enhanced_path
+from .enhance import enhanced_path, marker_path, target_rate
 
 NAME = "build"
 REQUIRES = ("select", "vad")
@@ -153,6 +155,7 @@ def run(cfg, args) -> None:
                 f"[{NAME}] run `python -m dsd enhance` to finish the cache, or set "
                 "build.use_enhanced=auto to build from raw audio where it is missing."
             )
+    _check_target_rates(cfg, calls)
 
     rows: list[dict] = []
     chunk_rows: list[dict] = []
@@ -178,6 +181,11 @@ def run(cfg, args) -> None:
             # before the mixture was split off the targets, so those rebuild too.
             or "targets_enhanced" not in meta
             or meta["targets_enhanced"] != _target_audio(call, record, cfg)[1]
+            # Targets written at another rate -- 8 kHz from before Sidon's band
+            # was kept, or 24 kHz while this run asks for 8 -- are another
+            # dataset. Meta from before the key existed was always the mix rate.
+            or meta.get("target_sample_rate", meta.get("sample_rate"))
+            != _expected_target_sr(cfg, meta["targets_enhanced"])
             # A call carrying a different number of degraded variants, or ones
             # drawn under different settings, would leave the dataset holding two
             # augmentation regimes at once. The fingerprint covers every knob
@@ -330,9 +338,10 @@ def _target_audio(call: str, record: dict, cfg) -> tuple[str, bool]:
     the model to separate *and* clean rather than to separate something already
     clean.
 
-    The enhanced file has the same rate and the same sample count as the
-    original -- the enhance stage refuses anything else -- so the two can be read
-    side by side and every VAD offset stays valid for both.
+    The enhanced file covers the same duration as the original, at
+    `enhance.output_sample_rate` -- 24 kHz, carrying the band Sidon restored,
+    against the mixture's 8 kHz. The ratio is an integer, so the two are read
+    side by side and each VAD interval is converted at each track's own rate.
     """
     mode = cfg.build.use_enhanced
     if mode == "never":
@@ -346,6 +355,73 @@ def _target_audio(call: str, record: dict, cfg) -> tuple[str, bool]:
             f"build.use_enhanced='always' but {cached} is missing; run `python -m dsd enhance`"
         )
     return record["audio"], False
+
+
+def _cache_record(cfg) -> dict:
+    """The enhancement cache's `cache.json`, or {} for a cache that predates it."""
+    path = marker_path(cfg)
+    return read_json(path) if path.exists() else {}
+
+
+def _expected_target_sr(cfg, targets_enhanced: bool) -> int:
+    """The rate s1/s2 are written at: the cache's rate when enhanced, else the source's."""
+    return target_rate(cfg) if targets_enhanced else int(cfg.sample_rate)
+
+
+def _check_target_rates(cfg, calls) -> None:
+    """Refuse, before any work, every way the targets could end up at mixed rates.
+
+    Checked here rather than per call for the same reason as `always` above: a
+    per-call failure becomes a tsv line and an exit code of 0. And these are not
+    per-call problems -- each one would leave the whole dataset holding targets
+    at two rates, which a model learns as a domain split, or holding files that
+    claim a band they do not carry.
+    """
+    wanted = target_rate(cfg)
+    if cfg.build.use_enhanced == "never" or wanted == cfg.sample_rate:
+        # Same-rate targets: the per-call check in `_build_call` covers a stray file.
+        return
+
+    if cfg.build.zerofy_mix:
+        # zerofy_mix defines the mixture as s1 + s2. With 24 kHz targets that
+        # mixture would be a downsample of Sidon's output -- no longer the call
+        # as recorded, and dependent on the restorer. Refused, not approximated.
+        raise SystemExit(
+            f"[{NAME}] build.zerofy_mix=true builds mix.wav from the targets, but the targets "
+            f"are {wanted} Hz and the mixture {cfg.sample_rate} Hz.\n"
+            f"[{NAME}] Set build.zerofy_mix=false (the mixture is then the recording), or "
+            "enhance.output_sample_rate=null for same-rate targets."
+        )
+
+    missing = [call for call, _ in calls if not enhanced_path(cfg, call).exists()]
+    if missing:
+        # auto would build these from the raw 8 kHz channels. Upsampling them
+        # would make 24 kHz files with nothing above 4 kHz -- plausible-looking,
+        # and exactly the target this change exists to stop producing.
+        raise SystemExit(
+            f"[{NAME}] {len(missing)} of {len(calls)} calls have no {wanted} Hz enhanced audio "
+            f"(e.g. {missing[0]}); building them raw would put {cfg.sample_rate} Hz targets "
+            f"next to {wanted} Hz ones.\n"
+            f"[{NAME}] Finish `python -m dsd enhance`, or set build.use_enhanced=never for a "
+            "uniformly raw 8 kHz dataset."
+        )
+
+    marker = marker_path(cfg)
+    recorded = read_json(marker).get("output_sample_rate") if marker.exists() else None
+    if recorded != wanted:
+        state = f"is marked {recorded} Hz" if recorded else "has no cache.json (an 8 kHz cache from before the marker)"
+        raise SystemExit(
+            f"[{NAME}] {cfg.paths.enhanced_dir} {state}, but enhance.output_sample_rate is "
+            f"{wanted} Hz. Re-run `python -m dsd enhance` into a fresh paths.enhanced_dir."
+        )
+    # The marker says what the cache was made as; the headers say what each file
+    # is. A --limit'ed --overwrite can leave both kinds in one directory.
+    stale = [call for call, _ in calls if probe(enhanced_path(cfg, call))[1] != wanted]
+    if stale:
+        raise SystemExit(
+            f"[{NAME}] {len(stale)} cached file(s) are not {wanted} Hz (e.g. {stale[0]}); the "
+            "cache is half-migrated. Re-enhance them with `python -m dsd enhance --overwrite`."
+        )
 
 
 def _taper_seam(signal: np.ndarray, shift: int, sr: int, fade_ms: float) -> np.ndarray:
@@ -473,16 +549,26 @@ def _build_call(
     # the input throws away the noise the model exists to cope with.
     mix_data, sr = read_audio(mix_path)
     if targets_enhanced:
-        target_data, target_sr = read_audio(target_path)
-        if target_sr != sr or target_data.shape != mix_data.shape:
-            # Every VAD offset below indexes both arrays. A quiet mismatch here
-            # would shift one of them against the labels for the whole call.
+        target_data, tsr = read_audio(target_path)
+        wanted = _expected_target_sr(cfg, True)
+        # Every VAD interval below is applied to both arrays, each at its own
+        # rate. A quiet mismatch here -- a stale file at another rate, or one a
+        # sample short -- would shift one of them against the labels for the
+        # whole call. The invariant is the same *duration*: with an integer
+        # ratio that is exactly `k` target samples per mixture sample.
+        k = tsr // sr if tsr % sr == 0 else 0
+        if (
+            tsr != wanted
+            or not k
+            or target_data.shape != (mix_data.shape[0] * k, mix_data.shape[1])
+        ):
             raise ValueError(
                 f"enhanced audio does not match the original: "
-                f"{target_data.shape} @ {target_sr} Hz vs {mix_data.shape} @ {sr} Hz"
+                f"{target_data.shape} @ {tsr} Hz vs {mix_data.shape} @ {sr} Hz "
+                f"(expected {wanted} Hz, the same duration)"
             )
     else:
-        target_data = mix_data
+        target_data, tsr, k = mix_data, sr, 1
 
     segments = read_rttm(cfg.paths.vad_dir / f"{call}.rttm")
     fade_ms = cfg.build.fade_ms
@@ -513,13 +599,22 @@ def _build_call(
     mix1 = mute(demux(mix_data, channels[0]), excluded.get(channels[0], []), sr, fade_ms)
     mix2 = mute(demux(mix_data, channels[1]), excluded.get(channels[1], []), sr, fade_ms)
     if targets_enhanced:
-        tgt1 = mute(demux(target_data, channels[0]), excluded.get(channels[0], []), sr, fade_ms)
-        tgt2 = mute(demux(target_data, channels[1]), excluded.get(channels[1], []), sr, fade_ms)
+        tgt1 = mute(demux(target_data, channels[0]), excluded.get(channels[0], []), tsr, fade_ms)
+        tgt2 = mute(demux(target_data, channels[1]), excluded.get(channels[1], []), tsr, fade_ms)
     else:
         tgt1, tgt2 = mix1, mix2
 
+    # Masks at the mixture's rate drive everything about the mixture: overlap,
+    # the shift search, the degraded variants, the background measurement. The
+    # targets get their own, from the same intervals in seconds converted at
+    # their own rate. At equal rates they are the same arrays.
     mask1 = speech_mask(intervals[channels[0]], n_samples, sr)
     mask2 = speech_mask(intervals[channels[1]], n_samples, sr)
+    if tsr != sr:
+        tmask1 = speech_mask(intervals[channels[0]], n_samples * k, tsr)
+        tmask2 = speech_mask(intervals[channels[1]], n_samples * k, tsr)
+    else:
+        tmask1, tmask2 = mask1, mask2
 
     natural = overlap_ratio(mask1, mask2)
 
@@ -539,29 +634,31 @@ def _build_call(
             guard_sec=cfg.build.seam_guard_ms / 1000.0,
         )
         # The whole channel rolls, background included -- and *both* copies roll
-        # by the same amount, or the mixture and the target stop describing the
-        # same moment of the same call.
+        # by the same amount of *time*, or the mixture and the target stop
+        # describing the same moment of the same call. The shift is a whole
+        # number of 10 ms frames, so `shift * k` at the target rate is exact.
         mix2 = _taper_seam(roll(mix2, shift), shift, sr, fade_ms)
         if targets_enhanced:
-            tgt2 = _taper_seam(roll(tgt2, shift), shift, sr, fade_ms)
+            tgt2 = _taper_seam(roll(tgt2, shift * k), shift * k, tsr, fade_ms)
         else:
             tgt2 = mix2
         mask2 = roll(mask2, shift)
+        tmask2 = roll(tmask2, shift * k) if tsr != sr else mask2
 
     # Level the whole channel, not only its speech: these samples go into the
     # mixture and into s2, so one gain has to cover both. The gain is measured on
     # the targets -- that is the speech level the model has to reproduce -- and
     # then multiplied into the mixture copy unchanged.
     sir_db = rng.uniform(*cfg.build.sir_db)
-    tgt2, sir_gain = scale_to_sir(tgt1, tgt2, mask1, mask2, sir_db)
+    tgt2, sir_gain = scale_to_sir(tgt1, tgt2, tmask1, tmask2, sir_db)
     mix2 = tgt2 if not targets_enhanced else (mix2 * sir_gain).astype(np.float32)
 
     # Targets: each speaker's own channel with everything outside their speech
     # faded away. The mixture keeps that material, which is what asks the model
     # to pull two clean voices out of a real recording rather than out of a
     # sum of two already-clean ones.
-    s1 = apply_mask(tgt1, mask1, sr, fade_ms)
-    s2 = apply_mask(tgt2, mask2, sr, fade_ms)
+    s1 = apply_mask(tgt1, tmask1, tsr, fade_ms)
+    s2 = apply_mask(tgt2, tmask2, tsr, fade_ms)
 
     # `zerofy_mix` buys the exact identity, and the only way to have it is for the
     # mixture to be the sum of the targets -- so that mode alone does not use the
@@ -573,11 +670,18 @@ def _build_call(
     # `zerofy_mix`, the recorded background otherwise. Measured here rather
     # than left for `verify` to discover, so a call whose noise floor swamps
     # its speech is visible in the manifest.
-    background_rms, background_snr = _background(mixture, s1, s2, mask1 | mask2)
+    # Measured at the mixture's rate: the mixture never had the band above its
+    # Nyquist, so the targets are brought down to it for this number only.
+    if tsr != sr:
+        background_rms, background_snr = _background(
+            mixture, resample(s1, tsr, sr), resample(s2, tsr, sr), mask1 | mask2
+        )
+    else:
+        background_rms, background_snr = _background(mixture, s1, s2, mask1 | mask2)
 
     write_wav(out_dir / "mix.wav", mixture, sr)
-    write_wav(out_dir / "s1.wav", s1, sr)
-    write_wav(out_dir / "s2.wav", s2, sr)
+    write_wav(out_dir / "s1.wav", s1, tsr)
+    write_wav(out_dir / "s2.wav", s2, tsr)
 
     # Degraded copies of the mixture. They are built from `mix1`/`mix2` -- the
     # two channels after the roll and the SIR gain but before the sum -- which is
@@ -633,9 +737,19 @@ def _build_call(
         # Kept so older readers (and `stats.json`) keep working.
         "source": mix_path,
         "enhanced": targets_enhanced,
-        "enhance_backend": cfg.enhance.backend if targets_enhanced else None,
+        # From the cache's own marker, not from config: config names what the
+        # *next* enhance run would use, which need not be what made these files.
+        # A cache from before the marker existed reports "unmarked".
+        "enhance_backend": _cache_record(cfg).get("backend", "unmarked") if targets_enhanced else None,
+        "enhance_model": _cache_record(cfg).get("model") if targets_enhanced else None,
+        # `sample_rate`/`samples` describe the mixture (and every mix_aug*):
+        # the model's input is the call as recorded, at 8 kHz. The targets
+        # carry their own rate -- 24 kHz when Sidon's restored band is kept --
+        # over exactly the same duration.
         "sample_rate": sr,
         "samples": int(len(mixture)),
+        "target_sample_rate": int(tsr),
+        "target_samples": int(len(s1)),
         "duration": round(len(mixture) / sr, 3),
         "speakers": record["speakers"],
         "genders": record["genders"],
@@ -658,7 +772,9 @@ def _build_call(
         # The mode this call was built in, so a rebuild can tell a cached call
         # apart from one that has to be redone.
         "shuffle": bool(shuffle),
+        # At the mixture's rate; `shift_sec` is the rate-free form of it.
         "shift_samples": int(shift),
+        "shift_sec": round(shift / sr, 6),
         "shifted": bool(shift),
         # Why this call is (or is not) shifted -- see mixing/overlap.py:safe_shifts.
         "shift_reason": shift_reason,
@@ -711,9 +827,17 @@ def _build_chunks(call: str, record: dict, meta: dict, cfg, dataset_dir: Path) -
     split = record["split"]
     call_dir = dataset_dir / split / call
     mixture, sr = read_audio(call_dir / "mix.wav")
-    s1, _ = read_audio(call_dir / "s1.wav")
-    s2, _ = read_audio(call_dir / "s2.wav")
+    s1, tsr = read_audio(call_dir / "s1.wav")
+    s2, tsr2 = read_audio(call_dir / "s2.wav")
     mixture, s1, s2 = mixture[:, 0], s1[:, 0], s2[:, 0]
+    # A window is a span of time; it is cut at each track's own rate, so the
+    # three slices of one chunk cover exactly the same interval.
+    k = tsr // sr if tsr % sr == 0 else 0
+    if not k or tsr2 != tsr or len(s1) != len(mixture) * k or len(s2) != len(s1):
+        raise ValueError(
+            f"targets do not cover the mixture's duration: s1 {len(s1)} @ {tsr} Hz, "
+            f"s2 {len(s2)} @ {tsr2} Hz, mix {len(mixture)} @ {sr} Hz"
+        )
 
     # Every degraded mixture is windowed the same way, at the same offsets. The
     # target slices are written once and shared, so four variants cost four
@@ -736,12 +860,13 @@ def _build_chunks(call: str, record: dict, meta: dict, cfg, dataset_dir: Path) -
     rows = []
     index = 0
     for start, end in windows(len(mixture), sr, cfg.build.chunk_sec, cfg.build.chunk_hop):
-        if not is_usable(mask1, mask2, start, end, sr, cfg.build.min_active_per_src):
+        t_start, t_end = start * k, end * k
+        if not is_usable(mask1, mask2, t_start, t_end, tsr, cfg.build.min_active_per_src):
             continue
         name = f"{call}_{index:04d}.wav"
         write_wav(out_root / "mix" / name, mixture[start:end], sr)
-        write_wav(out_root / "s1" / name, s1[start:end], sr)
-        write_wav(out_root / "s2" / name, s2[start:end], sr)
+        write_wav(out_root / "s1" / name, s1[t_start:t_end], tsr)
+        write_wav(out_root / "s2" / name, s2[t_start:t_end], tsr)
 
         common = {
             "s1": str((out_root / "s1" / name).relative_to(dataset_dir)),
@@ -751,11 +876,12 @@ def _build_chunks(call: str, record: dict, meta: dict, cfg, dataset_dir: Path) -
             "offset": round(start / sr, 3),
             "duration": round((end - start) / sr, 3),
             "sample_rate": sr,
+            "target_sample_rate": tsr,
             "speakers": meta["speakers"],
             "genders": meta["genders"],
             "overlap": round(
-                float(np.count_nonzero(mask1[start:end] & mask2[start:end]))
-                / max(int(np.count_nonzero(mask1[start:end] | mask2[start:end])), 1),
+                float(np.count_nonzero(mask1[t_start:t_end] & mask2[t_start:t_end]))
+                / max(int(np.count_nonzero(mask1[t_start:t_end] | mask2[t_start:t_end])), 1),
                 5,
             ),
         }
@@ -799,7 +925,9 @@ def _manifest_rows(meta: dict) -> list[dict]:
         "call": meta["call"],
         "split": meta["split"],
         "duration": meta["duration"],
+        # The mixture's rate, as it always was; s1/s2 have their own.
         "sample_rate": meta["sample_rate"],
+        "target_sample_rate": meta.get("target_sample_rate", meta["sample_rate"]),
         "speakers": meta["speakers"],
         "genders": meta["genders"],
         "overlap": meta["overlap"],
@@ -914,9 +1042,14 @@ def _write_stats(cfg, dataset_dir: Path, selection, rows, chunk_rows, stats,
         # silence -- shifting them anyway would cut an utterance in half.
         "shift_reason": dict(Counter(stats["shift_reason"])),
         "duration_sec": describe(stats["duration"]),
+        "sample_rate": {
+            "mix": int(cfg.sample_rate),
+            "targets": sorted({row.get("target_sample_rate", row["sample_rate"]) for row in rows}),
+        },
         "enhanced": {
             "mode": cfg.build.use_enhanced,
             "backend": cfg.enhance.backend,
+            "output_sample_rate": cfg.enhance.output_sample_rate,
             "calls": int(sum(stats["enhanced"])),
             "of": len(rows),
         },

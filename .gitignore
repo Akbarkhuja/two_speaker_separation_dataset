@@ -3,6 +3,7 @@ dataset/
 work*/
 work_mono/
 tutorials/
+models/
 
 configs/default.yaml
 

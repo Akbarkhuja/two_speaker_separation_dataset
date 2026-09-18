@@ -18,6 +18,12 @@ the identity then holds only where both speakers are at full gain, and what is
 checked elsewhere is that the background stays below the voices rather than
 above them. A dataset with no `stats.json`, or one written before this option
 existed, is checked the strict way.
+
+The three files need not share a rate. The mixture is at the source's 8 kHz;
+the targets are at the row's `target_sample_rate` -- 24 kHz when Sidon's
+restored band was kept. What must hold is the same duration, to the sample at
+an integer ratio. The mixture invariants compare samples, so they run on the
+targets brought down to the mixture's rate, for the check only.
 """
 
 from __future__ import annotations
@@ -27,7 +33,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..core.audio import read_audio
+from ..core.audio import read_audio, resample
 from ..core.manifest import read_json, read_jsonl
 from .base import banner, progress, require
 
@@ -48,12 +54,23 @@ MIN_BACKGROUND_SNR_DB = 0.0
 MAX_RESIDUAL_CORRELATION = 0.5
 
 # Where only one speaker is active, the mixture is that speaker's channel as
-# recorded and the target is the same channel denoised. They are the same voice
-# at the same instant, so they stay strongly correlated: measured on this corpus,
-# original against enhanced speech correlates at 0.997. A floor of 0.8 is
-# generous, and still collapses if mix/s1/s2 come from different calls or the
-# mixture was scaled on its own.
-MIN_SOLO_CORRELATION = 0.8
+# recorded and the target is the same channel restored: the same voice at the
+# same instant. Compared as short-time *magnitude* spectra, not waveforms, at
+# the mixture's rate. A masking enhancer keeps the input's phase and its output
+# correlates with the recording at 0.997 as a waveform, but Sidon resynthesises
+# through a vocoder and is not phase-locked to its input at all: measured on
+# real calls, waveform |corr| 0.00-0.04 for correctly aligned files. Magnitudes
+# do not care about phase. Pearson correlation of 32 ms magnitude spectra,
+# measured on real calls:
+#   correct, Sidon targets       0.82 - 0.89
+#   correct, masker targets      0.98 - 0.999
+#   target 50 ms out of step     0.30 - 0.47
+#   target 250 ms out of step    0.08 - 0.23
+#   target from another call     0.03 - 0.10
+# 0.65 sits between the worst correct file and the best broken one.
+MIN_SOLO_CORRELATION = 0.65
+SPECTRAL_FFT = 256   # 32 ms at 8 kHz
+SPECTRAL_HOP = 80    # 10 ms
 
 # How far a file's RMS may drift from the value build recorded before writing it.
 # PCM_16 rounding adds noise ~9e-6 rms, which moves a signal's RMS only to second
@@ -101,6 +118,47 @@ def _both_at_full_gain(s1: np.ndarray, s2: np.ndarray, fade: int) -> np.ndarray:
     channels; elsewhere the mixture carries background the targets faded out.
     """
     return _erode((s1 != 0.0) & (s2 != 0.0), fade)
+
+
+def _active(target: np.ndarray, k: int) -> np.ndarray:
+    """Where a target is non-zero, at the mixture's rate (`k` target samples each).
+
+    A mixture sample counts as active if any of its `k` target samples is; so
+    silence means all of them are exactly zero, which is what zerofying leaves.
+    """
+    on = target != 0.0
+    return on if k == 1 else on.reshape(-1, k).any(axis=1)
+
+
+def _spectral_alignment(mixture: np.ndarray, target: np.ndarray, solo: np.ndarray) -> float | None:
+    """Correlation of the two magnitude spectrograms, over frames wholly in `solo`.
+
+    Phase-free on purpose -- see MIN_SOLO_CORRELATION. None when there are too
+    few such frames (under ~0.2 s) to say anything.
+    """
+    n = (len(mixture) - SPECTRAL_FFT) // SPECTRAL_HOP + 1
+    if n <= 0:
+        return None
+    starts = SPECTRAL_HOP * np.arange(n)
+    keep = starts[_window_inside(solo, starts)]
+    if keep.size < 20:
+        return None
+    index = keep[:, None] + np.arange(SPECTRAL_FFT)[None, :]
+    window = np.hanning(SPECTRAL_FFT)
+    a = np.abs(np.fft.rfft(mixture[index].astype(np.float64) * window))
+    b = np.abs(np.fft.rfft(target[index].astype(np.float64) * window))
+    # Mean removed: magnitudes are all positive, so a plain cosine gives two
+    # unrelated dense signals ~0.6 before they share anything at all.
+    a -= a.mean()
+    b -= b.mean()
+    scale = float(np.sqrt((a * a).sum() * (b * b).sum()))
+    return float((a * b).sum() / scale) if scale > 0.0 else None
+
+
+def _window_inside(mask: np.ndarray, starts: np.ndarray) -> np.ndarray:
+    """Whether each window `[s, s + SPECTRAL_FFT)` lies entirely inside `mask`."""
+    counts = np.concatenate(([0], np.cumsum(mask, dtype=np.int64)))
+    return (counts[starts + SPECTRAL_FFT] - counts[starts]) == SPECTRAL_FFT
 
 
 def _residual_correlation(voices: np.ndarray, residual: np.ndarray) -> float:
@@ -419,15 +477,45 @@ def run(cfg, args) -> None:
             problems.append(f"{call}: unreadable ({exc})")
             continue
 
-        if not (sr == sr1 == sr2 == cfg.sample_rate):
-            problems.append(f"{call}: sample rates {sr}/{sr1}/{sr2}, expected {cfg.sample_rate}")
-        if not (len(mixture) == len(s1) == len(s2)):
+        # The mixture is at the source rate; the targets at whatever rate the
+        # manifest says they were written at (24 kHz with Sidon's band kept).
+        # Rows from before the key existed had one rate for all three.
+        tsr = int(row.get("target_sample_rate", sr))
+        if sr != cfg.sample_rate or sr1 != tsr or sr2 != tsr:
             problems.append(
-                f"{call}: length mismatch mix={len(mixture)} s1={len(s1)} s2={len(s2)}"
+                f"{call}: sample rates mix={sr} s1={sr1} s2={sr2}, expected mix={cfg.sample_rate} "
+                f"and targets={tsr}"
+            )
+            continue
+        if tsr % sr:
+            problems.append(f"{call}: target rate {tsr} is not a whole multiple of {sr}")
+            continue
+        # Same duration, to the sample: with an integer ratio that is exactly
+        # `k` target samples per mixture sample, and anything else means one
+        # track is shifted against the labels.
+        k = tsr // sr
+        if not (len(mixture) * k == len(s1) == len(s2)):
+            problems.append(
+                f"{call}: duration mismatch mix={len(mixture)} @ {sr} s1={len(s1)} s2={len(s2)} "
+                f"@ {tsr} (expected {len(mixture) * k})"
             )
             continue
 
-        left, right, mono = s1[:, 0], s2[:, 0], mixture[:, 0]
+        native_left, native_right, mono = s1[:, 0], s2[:, 0], mixture[:, 0]
+        # Every mixture invariant below compares the mixture with the targets
+        # sample by sample, so it needs one rate. It is the mixture's: the
+        # mixture never had the band above 4 kHz, so comparing at 24 kHz would
+        # mean inventing one for it, while bringing the targets down discards
+        # only what the mixture cannot hold. For this check only -- the files
+        # are untouched. Where a target is speech and where it is exactly zero
+        # is read off the native samples: resampling rings across a zerofied
+        # edge, so a resampled target has no exact zeros left to find.
+        left_on = _active(native_left, k)
+        right_on = _active(native_right, k)
+        if k > 1:
+            left, right = resample(native_left, tsr, sr), resample(native_right, tsr, sr)
+        else:
+            left, right = native_left, native_right
 
         # The three files must be the ones build wrote for this call. Checked by
         # level against the fingerprint in meta.json, because in the
@@ -438,7 +526,7 @@ def run(cfg, args) -> None:
         meta = read_json(meta_path) if meta_path.exists() else {}
         recorded = meta.get("rms")
         if recorded:
-            for name, signal in (("mix", mono), ("s1", left), ("s2", right)):
+            for name, signal in (("mix", mono), ("s1", native_left), ("s2", native_right)):
                 got = float(np.sqrt(np.mean(np.square(signal, dtype=np.float64))))
                 want = float(recorded.get(name, got))
                 if abs(got - want) > max(RMS_ABS_TOLERANCE, RMS_REL_TOLERANCE * want):
@@ -463,14 +551,18 @@ def run(cfg, args) -> None:
             #
             # What still has to be true: wherever exactly one speaker is at full
             # gain, the mixture is that speaker's channel as recorded and the
-            # target is the same channel denoised -- the same voice at the same
-            # instant. That collapses if the files come from different calls,
-            # are shifted against each other, or the mixture was scaled alone.
-            for name, target, other in (("s1", left, right), ("s2", right, left)):
-                solo = _erode(target != 0.0, fade) & (other == 0.0)
-                if solo.sum() < fade * 4:
+            # target is the same channel restored -- the same voice at the same
+            # instant. That collapses if the files come from different calls or
+            # are shifted against each other. (A level error is the RMS
+            # fingerprint's job above; both measures here are scale-free.)
+            for name, target, on, other_on in (
+                ("s1", left, left_on, right_on),
+                ("s2", right, right_on, left_on),
+            ):
+                solo = _erode(on, fade) & ~other_on
+                aligned = _spectral_alignment(mono, target, solo)
+                if aligned is None:
                     continue
-                aligned = _residual_correlation(mono[solo], target[solo])
                 worst_solo = aligned if worst_solo is None else min(worst_solo, aligned)
                 if aligned < MIN_SOLO_CORRELATION:
                     problems.append(
@@ -485,7 +577,7 @@ def run(cfg, args) -> None:
             # halves its output leaves a leftover exactly as loud as the voices
             # on a perfectly matched call. The alignment check above is what
             # catches mismatched files, and it does not care about level.
-            support = _erode(left != 0.0, fade) | _erode(right != 0.0, fade)
+            support = _erode(left_on, fade) | _erode(right_on, fade)
             if support.any():
                 voices = (left + right)[support]
                 noise = float(np.sqrt(np.mean(np.square(difference[support], dtype=np.float64))))
@@ -499,7 +591,7 @@ def run(cfg, args) -> None:
             # half-written trio of files. It needs the two to actually overlap
             # somewhere; calls where they never do are counted and reported
             # rather than passed over in silence.
-            exact = _both_at_full_gain(left, right, fade)
+            exact = _erode(left_on & right_on, fade)
             if exact.any():
                 residual = float(np.abs(difference[exact]).max())
                 worst_residual = max(worst_residual, residual)
@@ -516,7 +608,7 @@ def run(cfg, args) -> None:
             # be true of it: it sits under the voices, and it looks nothing
             # like them. The second is what still has teeth on a call where the
             # speakers never overlap and the exact test above never ran.
-            support = _erode(left != 0.0, fade) | _erode(right != 0.0, fade)
+            support = _erode(left_on, fade) | _erode(right_on, fade)
             if support.any():
                 voices = (left + right)[support]
                 leftover = difference[support]

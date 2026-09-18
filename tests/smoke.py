@@ -271,6 +271,38 @@ def residual_correlation_tells_background_from_a_mismatched_mixture():
     return f"honest {honest:.3f}, swapped {swapped:.3f}"
 
 
+@check("unit")
+def solo_alignment_ignores_phase_but_not_time():
+    """The enhanced-target check must pass a resynthesised target and fail a shifted one.
+
+    Sidon's output is not phase-locked to its input, so a waveform correlation
+    fails every correct file (measured 0.00-0.04). A 90-degree phase shift is
+    the extreme case: waveform correlation ~0, magnitudes identical.
+    """
+    rng = np.random.default_rng(3)
+    n = 4 * SR
+    # A new level *and* a new spectral colouring every 100 ms, the way speech
+    # changes from syllable to syllable, so a shift changes what each frame holds.
+    blocks = [
+        rng.uniform(0.05, 1.0) * np.convolve(rng.normal(0, 1, 800), rng.normal(0, 1, 16), mode="same")
+        for _ in range(n // 800)
+    ]
+    voice = np.concatenate(blocks).astype(np.float32)
+    spectrum = np.fft.rfft(voice)
+    spectrum[1:-1] *= -1j
+    quadrature = np.fft.irfft(spectrum, n=n).astype(np.float32)
+    solo = np.ones(n, dtype=bool)
+
+    waveform = verify_stage._residual_correlation(voice, quadrature)
+    same = verify_stage._spectral_alignment(voice, quadrature, solo)
+    shifted = verify_stage._spectral_alignment(voice, np.roll(quadrature, int(0.05 * SR)), solo)
+    floor = verify_stage.MIN_SOLO_CORRELATION
+    assert waveform < 0.1, f"test signal should defeat a waveform check, got {waveform:.3f}"
+    assert same > 0.95 and same > floor, f"phase-shifted copy scored {same:.3f}"
+    assert shifted < floor, f"a 50 ms shift scored {shifted:.3f}, above the {floor} floor"
+    return f"waveform {waveform:.3f}, same {same:.3f}, 50 ms off {shifted:.3f}"
+
+
 # --------------------------------------------------------------------------- #
 # [unit] overlap
 # --------------------------------------------------------------------------- #
@@ -900,55 +932,85 @@ def gender_client_parses_and_uploads_under_the_audio_field():
     assert b"RIFF" in body[:4096], "a WAV should have been uploaded"
 
 
-# Recorded from the live mossformergan_serve OpenAPI schema and a real probe:
-# pcm_f32le in and out, `sample_rate` required, `output_sample_rate` omitted so
-# it defaults to the input rate.
-def _mossformer_payload(samples, sr, gain=0.5, drop=0):
+# Modelled on sidon_serving's `/v1/restore` schema (server/schemas.py): pcm_f32le
+# in and out, `sample_rate` required, `output_sample_rate` honoured, and the
+# response naming every rate on the way through. The stub upsamples by sample
+# repetition -- not what Sidon does, but exact, so decoding can be checked to
+# the bit -- and returns a *different* rate than it was sent, which is the whole
+# point of the backend.
+def _sidon_payload(samples, sr, out_sr, gain=0.5, drop=0, report_rate=None):
     import base64
-    out = (np.asarray(samples, dtype=np.float32) * gain)
+    k = out_sr // sr
+    out = np.repeat(np.asarray(samples, dtype=np.float32), k) * gain
     if drop:
         out = out[:-drop]
     return {
         "audio": base64.b64encode(out.astype("<f4").tobytes()).decode(),
-        "sample_rate": sr,
+        "sample_rate": report_rate or out_sr,
         "format": "pcm_f32le",
         "input_sample_rate": sr,
-        "model_sample_rate": 16000,
+        "model_sample_rate": 48000,
         "duration_s": len(samples) / sr,
-        "num_chunks": 1,
+        "samples": int(len(out)),
+        "chunks": 1,
+        "chunk_seconds": 96.0,
+        "level_match": "peak",
+        "gain_applied": 1.0,
+        "length_adjusted": False,
         "processing_ms": 12.5,
         "real_time_factor": 0.31,
     }
 
 
-class _EnhanceHandler(BaseHTTPRequestHandler):
-    """Echoes the request back attenuated, so the client's contract is exercised."""
+class _RestoreHandler(BaseHTTPRequestHandler):
+    """Serves `/v1/restore` and `/healthz` the way sidon_serving does."""
 
     drop_samples = 0
+    report_rate = None
+    model = "Sidon"
+    requests: list = []
 
-    def do_POST(self):  # noqa: N802
-        import base64
-        length = int(self.headers.get("Content-Length", 0))
-        request = json.loads(self.rfile.read(length))
-        samples = np.frombuffer(base64.b64decode(request["audio"]), dtype="<f4")
-        payload = _mossformer_payload(
-            samples, request["sample_rate"], drop=_EnhanceHandler.drop_samples
-        )
+    def _reply(self, code: int, payload: dict) -> None:
         data = json.dumps(payload).encode()
-        self.send_response(200)
+        self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def do_GET(self):  # noqa: N802
+        if self.path != "/healthz":
+            return self._reply(404, {"detail": "Not Found"})
+        self._reply(200, {"status": "ok", "model": _RestoreHandler.model,
+                          "model_sample_rate": 48000, "engines": 1})
+
+    def do_POST(self):  # noqa: N802
+        import base64
+        if self.path != "/v1/restore":
+            # sidon_serving has no /v1/enhance; a client posting there must fail.
+            return self._reply(404, {"detail": "Not Found"})
+        length = int(self.headers.get("Content-Length", 0))
+        request = json.loads(self.rfile.read(length))
+        _RestoreHandler.requests.append({k: v for k, v in request.items() if k != "audio"})
+        samples = np.frombuffer(base64.b64decode(request["audio"]), dtype="<f4")
+        sr = request["sample_rate"]
+        out_sr = request.get("output_sample_rate") or sr
+        self._reply(200, _sidon_payload(
+            samples, sr, out_sr, drop=_RestoreHandler.drop_samples,
+            report_rate=_RestoreHandler.report_rate,
+        ))
 
     def log_message(self, *args):
         pass
 
 
 @contextlib.contextmanager
-def enhance_server(drop_samples=0):
-    _EnhanceHandler.drop_samples = drop_samples
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _EnhanceHandler)
+def restore_server(drop_samples=0, report_rate=None, model="Sidon"):
+    _RestoreHandler.drop_samples = drop_samples
+    _RestoreHandler.report_rate = report_rate
+    _RestoreHandler.model = model
+    _RestoreHandler.requests = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _RestoreHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -959,42 +1021,89 @@ def enhance_server(drop_samples=0):
 
 
 @check("http")
-def enhancer_round_trips_pcm_f32le():
-    from dsd.backends.speech_enhancement.mossformergan import HttpMossFormerGAN
+def sidon_returns_the_requested_wider_rate():
+    """8 kHz in, 24 kHz out, same duration -- and the rate was actually asked for.
+
+    The regression this guards: leaving `output_sample_rate` out makes the
+    service answer at the input rate, discarding the band Sidon restored.
+    """
+    from dsd.backends.speech_enhancement.sidon import HttpSidon
 
     rng = np.random.default_rng(0)
     span = rng.normal(0, 0.2, 4000).astype(np.float32)
-    with enhance_server() as base:
-        enhancer = HttpMossFormerGAN({"base_url": base})
+    with restore_server() as base:
+        enhancer = HttpSidon({"base_url": base, "output_sample_rate": 24000})
+        assert enhancer.output_rate(SR) == 24000
         out = enhancer.enhance(span, SR)
+        sent = _RestoreHandler.requests[-1]
 
-    assert len(out) == len(span), f"length changed: {len(span)} -> {len(out)}"
+    assert sent["output_sample_rate"] == 24000, sent
+    assert sent["sample_rate"] == SR and sent["level_match"] == "peak", sent
+    assert len(out) == 3 * len(span), f"{len(span)} @ 8 kHz -> {len(out)} @ 24 kHz"
+    assert approx(len(out) / 24000, len(span) / SR, 1e-12), "duration changed"
     assert out.dtype == np.float32
     # float32 both ways, so the round trip is exact rather than merely close.
-    assert np.allclose(out, span * 0.5, atol=1e-7), "payload was not decoded faithfully"
+    assert np.array_equal(out, np.repeat(span, 3) * np.float32(0.5)), "payload was not decoded faithfully"
     assert enhancer.requests == 1 and approx(enhancer.audio_seconds, len(span) / SR, 1e-6)
-    return f"{len(span)} samples, RTF telemetry captured"
+    return f"{len(span)} @ 8 kHz -> {len(out)} @ 24 kHz"
 
 
 @check("http")
-def enhancer_rejects_a_length_change():
+def sidon_always_sends_the_output_rate():
+    """Even at the input rate: the server's own default is an env var we do not control."""
+    from dsd.backends.speech_enhancement.sidon import HttpSidon
+
+    with restore_server() as base:
+        out = HttpSidon({"base_url": base}).enhance(np.zeros(800, np.float32) + 0.1, SR)
+        sent = _RestoreHandler.requests[-1]
+    assert sent["output_sample_rate"] == SR, sent
+    assert len(out) == 800
+
+
+@check("http")
+def enhancer_rejects_a_duration_change():
     """The invariant that makes splicing safe, enforced rather than assumed.
 
-    Every downstream label is a sample offset into the channel. A server that
-    returned a slightly different length would shift the whole call by a silent
-    amount, so the client must refuse rather than pad or trim.
+    Every downstream label is a time converted to a sample offset. A server that
+    returned one sample too few at 24 kHz would shift the rest of the span by a
+    silent amount, so the client must refuse rather than pad or trim.
     """
-    from dsd.backends.speech_enhancement.mossformergan import HttpMossFormerGAN
+    from dsd.backends.speech_enhancement.sidon import HttpSidon
 
     span = np.zeros(4000, dtype=np.float32)
-    with enhance_server(drop_samples=7) as base:
-        enhancer = HttpMossFormerGAN({"base_url": base})
+    with restore_server(drop_samples=1) as base:
+        enhancer = HttpSidon({"base_url": base, "output_sample_rate": 24000})
         try:
             enhancer.enhance(span, SR)
         except ValueError as exc:
-            assert "exact length match" in str(exc), str(exc)
+            assert "same duration" in str(exc), str(exc)
         else:
             raise AssertionError("a short reply must be refused, not spliced")
+
+
+@check("http")
+def enhancer_rejects_a_rate_it_did_not_ask_for():
+    from dsd.backends.speech_enhancement.sidon import HttpSidon
+
+    with restore_server(report_rate=16000) as base:
+        enhancer = HttpSidon({"base_url": base, "output_sample_rate": 24000})
+        try:
+            enhancer.enhance(np.zeros(4000, np.float32), SR)
+        except ValueError as exc:
+            assert "16000 Hz" in str(exc), str(exc)
+        else:
+            raise AssertionError("a reply at an unrequested rate must be refused")
+
+
+@check("http")
+def old_backend_name_is_the_sidon_client():
+    """`http_mossformergan` survives as a name only; it must speak /v1/restore at 24 kHz."""
+    from dsd.backends.speech_enhancement.sidon import HttpSidon
+
+    enhancer = ENHANCERS.create("http_mossformergan", {"base_url": "http://x", "output_sample_rate": 24000})
+    assert isinstance(enhancer, HttpSidon), type(enhancer)
+    assert enhancer.url.endswith("/v1/restore"), enhancer.url
+    assert enhancer.output_rate(SR) == 24000
 
 
 # --------------------------------------------------------------------------- #
@@ -1096,11 +1205,31 @@ class StubEnhancer:
         return (np.asarray(samples, dtype=np.float32) * self.gain).astype(np.float32)
 
 
+class StubWidebandEnhancer(StubEnhancer):
+    """The same fixed gain, returned at 3x the rate -- a stand-in for Sidon at 24 kHz.
+
+    A band-limited resample rather than sample repetition, so bringing a target
+    back down to 8 kHz recovers `GAIN * original` to within the resampler's
+    ripple, and the solo-gain check still has an exact answer (2.0).
+    """
+
+    FACTOR = 3
+
+    def output_rate(self, sr: int) -> int:
+        return sr * self.FACTOR
+
+    def enhance(self, samples: np.ndarray, sr: int) -> np.ndarray:
+        self.calls += 1
+        up = A.resample(np.asarray(samples, dtype=np.float32), sr, self.output_rate(sr))
+        return (up * self.gain).astype(np.float32)
+
+
 if "stub" not in VADS:
     VADS.register("stub")(StubVAD)
     EMBEDDERS.register("stub")(StubEmbedder)
     GENDER.register("stub")(StubGender)
     ENHANCERS.register("stub")(StubEnhancer)
+    ENHANCERS.register("stub_wideband")(StubWidebandEnhancer)
 
 
 # --------------------------------------------------------------------------- #
@@ -1254,6 +1383,8 @@ select:
   splits: {train: 0.5, dev: 0.25, test: 0.25}
 enhance:
   backend: stub
+  # Same-rate targets for the main fixture; `wideband_fixture` covers 24 kHz.
+  output_sample_rate: null
   regions: speech
   merge_gap: 0.5
   context_sec: 0.5
@@ -2690,6 +2821,226 @@ def real_pipeline_slice():
         return f"{len(suitable)} suitable, {len(rows)} built"
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+# [e2e] wideband targets: mixture at 8 kHz, s1/s2 at 24 kHz
+# --------------------------------------------------------------------------- #
+_WIDE_FIXTURE: dict | None = None
+WIDE_SR = 3 * SR
+
+
+def wideband_fixture() -> dict:
+    """The same corpus, enhanced to 24 kHz and built with 8 kHz mixtures.
+
+    Its own cache and dataset directories, so nothing the main fixture's checks
+    rebuild can leak in. The e2e config rolls every call (`natural_frac: 0`),
+    which is what exercises the shift being scaled to the target rate.
+    """
+    global _WIDE_FIXTURE
+    if _WIDE_FIXTURE is not None:
+        return _WIDE_FIXTURE
+
+    base = e2e_fixture()
+    root = base["root"]
+    config = root / "configs" / "wideband.yaml"
+    body = E2E_CONFIG.replace(
+        "  dataset_dir: dataset\n",
+        "  dataset_dir: dataset_24k\n  enhanced_dir: work/enhanced_24k\n",
+    ).replace(
+        "  backend: stub\n  # Same-rate targets for the main fixture; `wideband_fixture` covers 24 kHz.\n"
+        "  output_sample_rate: null\n",
+        f"  backend: stub_wideband\n  output_sample_rate: {WIDE_SR}\n",
+    )
+    assert "stub_wideband" in body and "enhanced_24k" in body, "wideband config did not apply"
+    config.write_text(body, encoding="utf-8")
+
+    def run(*args: str) -> str:
+        with quiet() as buffer:
+            try:
+                code = cli.main(["--config", str(config), *args])
+            except SystemExit as exc:
+                # verify reports its problems on stdout and then exits; keep them.
+                code = exc.code if isinstance(exc.code, int) else f"{exc.code}"
+        output = buffer.getvalue()
+        if code != 0:
+            raise AssertionError(f"`dsd {' '.join(args)}` exited {code}\n{output}")
+        return output
+
+    logs = {"enhance": run("enhance"), "build": run("build", "--chunks"), "verify": run("verify")}
+    _WIDE_FIXTURE = {"root": root, "run": run, "logs": logs, "dataset": root / "dataset_24k"}
+    return _WIDE_FIXTURE
+
+
+def _refused(run, *args: str) -> str:
+    """Run a command that must fail; return what it said."""
+    try:
+        run(*args)
+    except (AssertionError, SystemExit) as exc:
+        return str(exc)
+    raise AssertionError(f"`dsd {' '.join(args)}` should have been refused")
+
+
+@check("e2e")
+def wideband_targets_cover_the_mixture_duration():
+    fixture = wideband_fixture()
+    dataset = fixture["dataset"]
+    rows = list(read_jsonl(dataset / "manifest.jsonl"))
+    assert rows, "no rows built"
+
+    shifted = 0
+    for row in rows:
+        assert row["sample_rate"] == SR and row["target_sample_rate"] == WIDE_SR, row
+        mixture, sr = A.read_audio(dataset / row["mix"])
+        s1, sr1 = A.read_audio(dataset / row["s1"])
+        s2, sr2 = A.read_audio(dataset / row["s2"])
+        assert (sr, sr1, sr2) == (SR, WIDE_SR, WIDE_SR), (sr, sr1, sr2)
+        # Same duration to the sample: exactly three target samples per mixture sample.
+        assert len(s1) == len(s2) == 3 * len(mixture), (len(mixture), len(s1), len(s2))
+        meta = read_json(dataset / row["split"] / row["call"] / "meta.json")
+        assert meta["target_sample_rate"] == WIDE_SR and meta["target_samples"] == len(s1)
+        shifted += bool(meta["shifted"])
+    assert shifted, "the fixture should roll at least one call"
+
+    chunks = list(read_jsonl(dataset / "chunks" / "manifest.jsonl"))
+    assert chunks, "no chunks cut"
+    for row in chunks:
+        mixture, sr = A.read_audio(dataset / row["mix"])
+        s1, tsr = A.read_audio(dataset / row["s1"])
+        assert sr == SR and tsr == WIDE_SR and len(s1) == 3 * len(mixture), row["mix"]
+        assert len(mixture) == int(round(4.0 * SR)), len(mixture)
+    return f"{len(rows)} calls, {shifted} rolled, {len(chunks)} chunks, 8 kHz mix / 24 kHz targets"
+
+
+@check("e2e")
+def wideband_targets_line_up_with_the_mixture():
+    """The alignment check that matters, across rates.
+
+    Brought back to 8 kHz, a target is the stub's 0.5x of the channel, so where
+    only that speaker talks the mixture is exactly 2.0x the target. A target a
+    few samples out of step with the mixture -- a shift rolled at the wrong
+    rate, an offset scaled wrongly in the splice -- decorrelates and the gain
+    collapses. Checked on both speakers of every call; every call is rolled.
+    """
+    fixture = wideband_fixture()
+    dataset = fixture["dataset"]
+    fade = int(0.01 * SR)
+    gains = []
+    for row in read_jsonl(dataset / "manifest.jsonl"):
+        mixture = A.read_audio(dataset / row["mix"])[0][:, 0]
+        s1 = A.read_audio(dataset / row["s1"])[0][:, 0]
+        s2 = A.read_audio(dataset / row["s2"])[0][:, 0]
+        on1, on2 = verify_stage._active(s1, 3), verify_stage._active(s2, 3)
+        low1, low2 = A.resample(s1, WIDE_SR, SR), A.resample(s2, WIDE_SR, SR)
+        for name, target, on, other_on in (("s1", low1, on1, on2), ("s2", low2, on2, on1)):
+            # Wider erosion than verify's: the resampler rings for a few ms either
+            # side of a fade, and this check wants only the clean interior.
+            solo = verify_stage._erode(on, 4 * fade) & verify_stage._erode(~other_on, 4 * fade)
+            assert solo.sum() > SR // 4, f"{row['call']}: no solo stretch for {name}"
+            t = target[solo].astype(np.float64)
+            gain = float(np.dot(mixture[solo], t) / np.dot(t, t))
+            assert abs(gain - 1.0 / StubEnhancer.GAIN) < 0.05, (
+                f"{row['call']} {name}: mixture is {gain:.3f}x the target where only {name} "
+                "speaks; expected 2.0x -- the 24 kHz target is out of step with the mixture"
+            )
+            gains.append(gain)
+    return f"{len(gains)} solo stretches, gain {min(gains):.3f}..{max(gains):.3f} (expect 2.0)"
+
+
+@check("e2e")
+def wideband_verify_passes_and_catches_a_wrong_rate_target():
+    fixture = wideband_fixture()
+    assert "OK -- every check passed" in fixture["logs"]["verify"], fixture["logs"]["verify"]
+
+    dataset = fixture["dataset"]
+    row = next(iter(read_jsonl(dataset / "manifest.jsonl")))
+    path = dataset / row["s2"]
+    original = path.read_bytes()
+    s2, _ = A.read_audio(path)
+    try:
+        # The plausible mistake: an 8 kHz target where a 24 kHz one belongs.
+        A.write_wav(path, A.resample(s2[:, 0], WIDE_SR, SR), SR)
+        said = _refused(fixture["run"], "verify")
+        assert "sample rates" in said, said
+    finally:
+        path.write_bytes(original)
+    return "clean, and an 8 kHz s2 among 24 kHz targets is caught"
+
+
+@check("e2e")
+def zerofy_mix_at_mixed_rates_is_refused():
+    """mix == s1 + s2 cannot hold across rates without making mix a downsample of the targets."""
+    fixture = wideband_fixture()
+    said = _refused(fixture["run"], "--set", "build.zerofy_mix=true", "build", "--overwrite")
+    assert "zerofy_mix" in said and "Hz" in said, said
+
+
+@check("e2e")
+def a_cache_at_another_rate_is_refused():
+    """A half-migrated cache is the worst outcome here: both stages must refuse to use one."""
+    fixture = wideband_fixture()
+    root = fixture["root"]
+    run = fixture["run"]
+
+    # build at 24 kHz pointed at the main fixture's 8 kHz cache
+    said = _refused(run, "--set", "paths.enhanced_dir=work/enhanced", "build", "--overwrite")
+    assert "8000 Hz" in said and "24000 Hz" in said, said
+
+    # enhance at 24 kHz into that same 8 kHz cache
+    said = _refused(run, "--set", "paths.enhanced_dir=work/enhanced", "enhance")
+    assert "made differently" in said and "output_sample_rate" in said, said
+
+    # a cache from before the marker existed: audio, no cache.json
+    legacy = root / "work" / "enhanced_legacy"
+    legacy.mkdir(exist_ok=True)
+    try:
+        some = next((root / "work" / "enhanced").glob("*.wav"))
+        shutil.copy(some, legacy / some.name)
+        said = _refused(run, "--set", "paths.enhanced_dir=work/enhanced_legacy", "enhance")
+        assert "no cache.json" in said, said
+    finally:
+        shutil.rmtree(legacy, ignore_errors=True)
+
+
+@check("e2e")
+def enhance_stage_drives_the_sidon_client_at_24k():
+    """The real client inside the real stage, against a stub /v1/restore.
+
+    Also the guard that would have caught the original mislabel: a backend named
+    for one model, and a service reporting another, must not fill a cache.
+    """
+    fixture = wideband_fixture()
+    root = fixture["root"]
+    run = fixture["run"]
+    target = root / "work" / "enhanced_http"
+    try:
+        with restore_server(model="MossFormerGAN_SE_16K") as base:
+            said = _refused(
+                run, "--set", "enhance.backend=http_sidon",
+                "--set", f"enhance.options.http_sidon.base_url={base}",
+                "--set", "paths.enhanced_dir=work/enhanced_http", "enhance", "--limit", "1",
+            )
+        assert "expects the service to be 'Sidon'" in said, said
+
+        with restore_server() as base:
+            run(
+                "--set", "enhance.backend=http_sidon",
+                "--set", f"enhance.options.http_sidon.base_url={base}",
+                "--set", "paths.enhanced_dir=work/enhanced_http", "enhance", "--limit", "1",
+            )
+            sent = list(_RestoreHandler.requests)
+        assert sent and all(r["output_sample_rate"] == WIDE_SR for r in sent), sent[:1]
+        written = sorted(target.glob("*.wav"))
+        assert len(written) == 1, written
+        data, rate = A.read_audio(written[0])
+        source = next((root / "corpus").rglob(written[0].name))
+        original, _ = A.read_audio(source)
+        assert rate == WIDE_SR and len(data) == 3 * len(original), (rate, len(data), len(original))
+        marker = read_json(target / "cache.json")
+        assert marker["model"] == "Sidon" and marker["output_sample_rate"] == WIDE_SR, marker
+    finally:
+        shutil.rmtree(target, ignore_errors=True)
+    return f"{len(sent)} requests at 24 kHz, wrong model refused"
 
 
 # --------------------------------------------------------------------------- #

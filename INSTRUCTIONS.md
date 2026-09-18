@@ -63,7 +63,7 @@ python -m dsd backends        # every registered backend
 | `embed` (titanet) | `titanet-l.nemo` | set in `configs/default.yaml` |
 | `gender` (http_ecapa) | Docker service on **port 8001** | must be started, see §8 |
 | `diarize` (moss_http) | vLLM/SGLang server on port 8000 | optional backend, see §8 |
-| `enhance` (http_mossformergan) | MossFormerGAN service on **port 8000** | must be started, see §8 |
+| `enhance` (http_sidon) | Sidon service (`sidon_serving`) on **port 8000** | must be started, see §8 |
 
 The default path (`sortformer` + `silero` + `titanet`) needs a GPU but no
 network. `gender` and `enhance` each need their service running. Note that
@@ -144,17 +144,37 @@ python -m dsd verify
 Budget roughly **2 hours** for `diarize` over the full corpus (5613 calls, both
 channels, ~259x realtime on the 4060), plus embedding time.
 
-`enhance` dominates everything else: throughput is **~3.2x realtime and does not
-improve with concurrency**, so the 2513 selected calls take roughly **22 hours**.
-It prints that estimate before it starts. Every stage is resumable, so it is safe
-to interrupt and re-run the same command — and if you want a dataset now, run the
-chain without `enhance` and add it later:
+`enhance` is the GPU-heavy stage. Against the Sidon service it measured **~25x
+realtime** on a first 2-call run, so the ~22 h of selected speech is roughly an hour;
+it prints its estimate before it starts. Every stage is resumable, so it is safe to
+interrupt and re-run the same command.
+
+The targets come out at **24 kHz** (`enhance.output_sample_rate`) while `mix.wav`
+stays 8 kHz — see README. The cache is therefore ~3x the size it was at 8 kHz
+(the old 8 kHz cache was ~6 GB; expect ~18 GB).
+
+If you want a dataset *before* enhancing, it has to be a uniformly raw 8 kHz one —
+`build` refuses to put 8 kHz raw targets next to 24 kHz restored ones:
 
 ```bash
-python -m dsd run --stages diarize,filter,vad,embed,cluster,gender,select,build
-python -m dsd enhance                       # overnight
-python -m dsd build --overwrite --chunks    # cheap; re-reads the cache
+python -m dsd run --stages diarize,filter,vad,embed,cluster,gender,select
+python -m dsd --set build.use_enhanced=never build --chunks   # raw 8 kHz targets, now
+python -m dsd enhance                                          # 24 kHz cache
+python -m dsd build --overwrite --chunks                       # cheap; re-reads the cache
 ```
+
+**Moving from an existing 8 kHz cache.** `work/enhanced/` made before this change has
+no `cache.json` and holds 8 kHz masking-model output; `enhance` will not extend it and
+`build` will not use it at 24 kHz. Move it aside, or give the new cache its own
+directory:
+
+```bash
+mv work/enhanced work/enhanced_8k                     # or:
+python -m dsd --set paths.enhanced_dir=work/enhanced_sidon24k enhance
+```
+
+To go back to 8 kHz targets for a run, `--set enhance.output_sample_rate=null` (and a
+cache made at 8 kHz).
 
 `--chunks` additionally writes fixed-length training windows under
 `dataset/chunks/`. Without it you get full-call mixtures only.
@@ -256,9 +276,11 @@ prints a warning and carries on with gender balancing disabled:
 [select] gender.json not found -- balancing skipped
 ```
 
-`enhance` is optional in the same sense: `build.use_enhanced` defaults to `auto`, so a
-missing cache just means the dataset is built from raw audio. Set it to `always` if you
-want `build` to refuse rather than quietly mix enhanced and raw calls in one dataset.
+`enhance` is optional, but no longer silently: at 24 kHz targets, `build` with
+`use_enhanced: auto` refuses when any selected call has no cached audio, because
+building those from raw audio would mix 8 kHz and 24 kHz targets in one dataset. Skip it
+explicitly with `--set build.use_enhanced=never` (all targets raw, 8 kHz), or finish the
+cache.
 
 `augment` is optional too, but differently: it needs no service, only the impulse-response
 and noise corpora that `augment.ir_dir` / `augment.noise_dir` point at. If you do not have
@@ -309,7 +331,7 @@ too. Read a row as "run these, in this order":
 | `cluster.threshold` | `cluster --overwrite`, `select --overwrite`, `build --overwrite` |
 | the gender service or its options | `gender --overwrite`, `select --overwrite`, `build --overwrite` |
 | `select.*` caps or splits | `select --overwrite`, `build --overwrite` |
-| `enhance.*`, or the enhancement service | `enhance --overwrite`, `build --overwrite` |
+| `enhance.*`, or the enhancement service | a fresh `paths.enhanced_dir` (or `enhance --overwrite`), then `build --overwrite`; `enhance` refuses to extend a cache made differently |
 | `augment.*` corpora or room settings | `augment --overwrite`, `build --overwrite` |
 | `build.augment.*` (incl. `variants`) | `build` — it notices the change itself and rebuilds what it must |
 | `build.*` mixing parameters (incl. `seam_guard_ms`) | `build --overwrite` |
@@ -425,6 +447,19 @@ python -m dsd --set diarize.backend=moss_http diarize --workers 8
 MOSS is 0.9 B and wants ~6 GB of VRAM, so on the 8 GB card it cannot share the
 GPU with `sortformer` or `titanet`. Run those stages separately.
 
+```bash
+# enhance stage -- Sidon (sidon_serving), POST /v1/restore, port 8000
+cd /home/akbar/craft/prod && SIDON_DEVICES=cuda:0 \
+    /home/akbar/miniconda3/envs/nemo/bin/python -m uvicorn \
+    sidon_serving.server.app:app --host 0.0.0.0 --port 8000
+curl -s localhost:8000/healthz          # must report "model": "Sidon", model_sample_rate 48000
+python -m dsd enhance
+```
+
+Use the `nemo` env: `sidon_serving/venv` points at a Python 3.11 that is no longer
+installed. `enhance` refuses to run if `/healthz` names any model other than Sidon.
+`http_mossformergan` is an old name for the same client.
+
 ---
 
 ## 9. Checking the result
@@ -486,6 +521,10 @@ cross-stage contracts that `verify` alone would not.
 | A stage produces almost nothing | its input directory exists but is empty; the guard only checks existence (§5) |
 | `gender` fails on every call | the Docker service is not up, or is on 8000 instead of 8001 (§8) |
 | `[select] gender.json not found` | expected when `gender` was skipped; balancing is disabled |
+| `[enhance] ... holds audio but no cache.json` | an 8 kHz cache from before the marker; move it aside or use a new `paths.enhanced_dir` (§4) |
+| `[enhance] ... was made differently` | the cache was made at another rate or by another model; same fix |
+| `[build] ... have no 24000 Hz enhanced audio` | `auto` would mix raw 8 kHz targets with 24 kHz ones; finish `enhance`, or `use_enhanced=never` |
+| `[build] build.zerofy_mix=true builds mix.wav from the targets` | refused at mixed rates; set `enhance.output_sample_rate=null` for that mode |
 
 Failures never abort a run. Check `work/<stage>_failed.tsv` for the per-item
 reason.
